@@ -1181,13 +1181,25 @@ async def scheduler_reconcile(app: Client, store: BacklogStore, target_key: str)
         if mid is not None:
             existing_ids.add(int(mid))
 
-    # Mark DB items scheduled if their message id still exists.
-    # If DB says scheduled but id is missing, revert to pending (so we can re-schedule).
+    # Reconcile DB items marked as scheduled.
+    # If message id is still in the scheduled list -> keep as scheduled.
+    # If message id is missing from the scheduled list, Telegram most likely already sent it.
+    # In that case, mark it as posted to avoid re-scheduling duplicates.
     async for item in store.items.find({"target_key": target_key, "status": "scheduled"}):
         mid = item.get("scheduled_message_id")
         if isinstance(mid, int) and mid in existing_ids:
             continue
-        await store.set_item_status(item["_id"], "pending", scheduled_message_id=None)
+
+        if isinstance(mid, int):
+            await store.set_item_status(
+                item["_id"],
+                "posted",
+                posted_message_id=mid,
+                posted_at=now_utc(),
+            )
+        else:
+            # No usable id; fall back to pending so we can try again.
+            await store.set_item_status(item["_id"], "pending", scheduled_message_id=None)
 
 
 async def telegram_scheduler_loop(cfg: BacklogConfig, store: BacklogStore, app: Client) -> None:
@@ -1240,7 +1252,10 @@ async def telegram_scheduler_loop(cfg: BacklogConfig, store: BacklogStore, app: 
                 candidate = (last_sched_dt + timedelta(seconds=cfg.interval_seconds)) if last_sched_dt else None
                 next_time = max(min_next, _ceil_to_minute(candidate)) if candidate else min_next
 
-            # Schedule items until horizon
+            # Schedule items until horizon.
+            # To avoid scheduling a large offline backlog all at once right after startup,
+            # we intentionally schedule at most ONE item per target per loop.
+            scheduled_this_tick = 0
             while next_time <= horizon:
                 item = await store.get_next_due_item(target_key=target_key)
                 if not item:
@@ -1278,6 +1293,9 @@ async def telegram_scheduler_loop(cfg: BacklogConfig, store: BacklogStore, app: 
                     )
                     # increment next schedule slot
                     next_time = _ceil_to_minute(next_time + timedelta(seconds=cfg.interval_seconds))
+                    scheduled_this_tick += 1
+                    if scheduled_this_tick >= 1:
+                        break
                 else:
                     updated = await store.bump_failure(item["_id"], err or "unknown", retry_after_seconds=cfg.scan_every_seconds)
                     if updated and int(updated.get("fail_count", 0)) >= cfg.max_failures:
