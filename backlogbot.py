@@ -718,13 +718,20 @@ async def handle_success(cfg: BacklogConfig, *, target_key: str, media: Path, si
         return
 
 
-async def scan_backlog(cfg: BacklogConfig, store: BacklogStore) -> None:
-    """Scan BACKLOG_ROOT, discover stable media files, and enqueue them in DB."""
+async def scan_backlog(cfg: BacklogConfig, store: BacklogStore, app: Optional[Client] = None) -> None:
+    """Scan BACKLOG_ROOT, discover stable media files, and enqueue them in DB.
+
+    If `app` is provided, we can be "smarter" about mapping folder names to the
+    configured allowlist by resolving Telegram peers (e.g. allowlist contains a
+    numeric chat id but the folder on disk is an @username).
+    """
     logger.debug("scan_backlog: starting scan")
     ensure_dir(cfg.backlog_root)
     allowlist = parse_allowlist(cfg.targets_allowlist)
 
     alias_map = build_allowlist_alias_map(allowlist)
+    # Per-scan cache so we don't repeatedly resolve the same folder name.
+    resolved_folder_to_canonical: Dict[str, str] = {}
 
     logger.info(
         "scan_backlog: root=%s allowlist_count=%d allowlist=%s",
@@ -749,11 +756,20 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore) -> None:
         folder_name = child.name
 
         # We only scan folders that can map to allowlist somehow.
-        # Mapping strategy v1: folder_name itself must be in allowlist OR be resolvable to one later.
-        # We defer resolution to posting; for scanning we require that folder_name matches some allowlist token
-        # OR is numeric / @-username, otherwise quarantine.
-
-        looks_like_target = folder_name.startswith("@") or re.fullmatch(r"-?\d+", folder_name) is not None
+        # Mapping strategy:
+        #   - Fast path: alias_map (format variants like @name<->name, -100id<->id)
+        #   - Smart path (if app provided): resolve folder peer_id and match it to
+        #     one of the allowlisted tokens by peer_id.
+        #
+        # Folder names we consider "target-like":
+        #   - @username
+        #   - numeric (chat id)
+        #   - bare username-ish (so folders named 'MyChannel' work too)
+        looks_like_target = (
+            folder_name.startswith("@")
+            or re.fullmatch(r"-?\d+", folder_name) is not None
+            or re.fullmatch(r"[A-Za-z0-9_]{4,}", folder_name) is not None
+        )
         if not looks_like_target:
             if cfg.skip_quarantine_unmapped_targets:
                 logger.info(
@@ -768,7 +784,26 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore) -> None:
                     await quarantine_paths(cfg, reason="unmapped_target", target_bucket=folder_name, paths=files)
             continue
 
-        canonical_target = alias_map.get(folder_name)
+        canonical_target = resolved_folder_to_canonical.get(folder_name) or alias_map.get(folder_name)
+        if canonical_target is None and app is not None:
+            # "Smart" mapping: allow allowlist entries like -100123... while
+            # accepting folders like @MyChannel (or MyChannel) by resolving peer_id.
+            try:
+                folder_peer_id = await resolve_peer_id(app, store, target_key=folder_name, allowlist_token=folder_name)
+            except Exception:
+                folder_peer_id = None
+
+            if isinstance(folder_peer_id, int):
+                for allow_tok in allowlist:
+                    try:
+                        allow_peer_id = await resolve_peer_id(app, store, target_key=allow_tok, allowlist_token=allow_tok)
+                    except Exception:
+                        continue
+                    if allow_peer_id == folder_peer_id:
+                        canonical_target = allow_tok
+                        # Cache for the rest of this scan cycle.
+                        resolved_folder_to_canonical[folder_name] = canonical_target
+                        break
         if canonical_target is None:
             if cfg.skip_quarantine_unmapped_targets:
                 logger.info(
@@ -992,7 +1027,7 @@ async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client)
             continue
 
         logger.debug("direct_post_loop: tick scope=%s", cfg.scope)
-        await scan_backlog(cfg, store)
+        await scan_backlog(cfg, store, app)
 
         if cfg.scope == "global":
             item = await store.get_next_due_item(target_key=None)
@@ -1210,7 +1245,7 @@ async def telegram_scheduler_loop(cfg: BacklogConfig, store: BacklogStore, app: 
             await asyncio.sleep(5)
             continue
 
-        await scan_backlog(cfg, store)
+        await scan_backlog(cfg, store, app)
 
         horizon = now_utc() + timedelta(seconds=cfg.schedule_ahead_seconds)
 
