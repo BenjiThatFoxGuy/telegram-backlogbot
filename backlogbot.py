@@ -990,12 +990,26 @@ async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client)
 
             target_doc = await store.get_or_create_target(target_key)
             if not await should_post_now(cfg, target_doc):
-                logger.debug("direct_post_loop: should_post_now=false for target=%s", target_key)
-                await asyncio.sleep(5)
-                continue
+                # Startup kick (global scope): allow one immediate post per target even if cadence says wait.
+                if (
+                    cfg.immediate_post_on_start
+                    and target_key not in posted_immediately_for
+                    and (now_utc() - started_at).total_seconds() <= max(30, cfg.scan_every_seconds * 2)
+                ):
+                    logger.info(
+                        "direct_post_loop: immediate startup post (global) for target=%s rel=%s",
+                        target_key,
+                        item.get("rel_path"),
+                    )
+                else:
+                    logger.debug("direct_post_loop: should_post_now=false for target=%s", target_key)
+                    await asyncio.sleep(5)
+                    continue
 
             peer_id = await resolve_peer_id(app, store, target_key, target_key)
             ok, msg_id, err = await send_one_item(cfg, store, app, item, peer_id)
+            if cfg.immediate_post_on_start and target_key not in posted_immediately_for:
+                posted_immediately_for.add(target_key)
             if ok:
                 logger.info(
                     "direct_post_loop: posted target=%s rel=%s msg_id=%s",
