@@ -370,11 +370,45 @@ class BacklogStore:
             "peer_id": None,
             "last_post_at": None,
             "last_scheduled_at": None,
+            # Fixed-cadence scheduler anchor: next schedule slot for this target.
+            # When BACKLOG_USE_TELEGRAM_SCHEDULER=true, we schedule items at cadence_next_at,
+            # then bump it forward by BACKLOG_INTERVAL_SECONDS. Persisted across restarts.
+            "cadence_next_at": None,
             "created_at": now_utc(),
             "updated_at": now_utc(),
         }
         await self.targets.insert_one(doc)
         return doc
+
+
+def _ensure_aware_utc(dt: Any) -> Optional[datetime]:
+    """Best-effort normalize datetime to timezone-aware UTC."""
+    if dt is None:
+        return None
+    if isinstance(dt, str):
+        try:
+            parsed = datetime.fromisoformat(dt)
+        except Exception:
+            return None
+        dt = parsed
+    if not isinstance(dt, datetime):
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _roll_forward(dt: datetime, *, min_dt: datetime, step_seconds: int) -> datetime:
+    """Roll dt forward by N*step until dt >= min_dt (dt is returned unchanged if already >=)."""
+    if dt >= min_dt:
+        return dt
+    if step_seconds <= 0:
+        return min_dt
+    delta = (min_dt - dt).total_seconds()
+    steps = int(delta // step_seconds)
+    if dt + timedelta(seconds=steps * step_seconds) < min_dt:
+        steps += 1
+    return dt + timedelta(seconds=steps * step_seconds)
 
     async def set_target_peer_id(self, target_key: str, peer_id: int) -> None:
         await self.targets.update_one(
@@ -1010,50 +1044,31 @@ async def telegram_scheduler_loop(cfg: BacklogConfig, store: BacklogStore, app: 
             target_doc = await store.get_or_create_target(target_key)
             peer_id = await resolve_peer_id(app, store, target_key, target_key)
 
-            # determine last scheduled anchor
-            last_sched = target_doc.get("last_scheduled_at")
-            if last_sched is None:
-                last_sched_dt = None
-            elif isinstance(last_sched, str):
-                try:
-                    last_sched_dt = datetime.fromisoformat(last_sched)
-                    if last_sched_dt.tzinfo is None:
-                        last_sched_dt = last_sched_dt.replace(tzinfo=timezone.utc)
-                except Exception:
-                    last_sched_dt = None
-            else:
-                last_sched_dt = last_sched
-
-            # Normalize naive datetimes returned by Mongo depending on tz_aware settings.
-            if isinstance(last_sched_dt, datetime) and last_sched_dt.tzinfo is None:
-                last_sched_dt = last_sched_dt.replace(tzinfo=timezone.utc)
-
-            # Always schedule in the future.
-            # If we restart and last_scheduled_at is far in the past, we want the *next* schedule
-            # time to be at least (now + min_delay) rather than piling messages onto an old time.
+            # -----------------------------
+            # Fixed cadence scheduling (Semantics A)
+            # -----------------------------
+            # cadence_next_at is the persisted "next slot". It survives restarts.
+            # On each loop we ensure it's at least now+min_delay, rolling forward by interval.
             min_next = now_utc() + timedelta(seconds=cfg.min_schedule_delay_seconds)
 
-            candidate = (last_sched_dt + timedelta(seconds=cfg.interval_seconds)) if isinstance(last_sched_dt, datetime) else None
-            next_time = max(min_next, candidate) if candidate else min_next
-
-            # DB repair: if stored last_scheduled_at would cause scheduling in the past, bump it forward
-            # so future container restarts don't keep anchoring on an ancient timestamp.
-            # We set it such that last_scheduled_at + interval == next_time.
-            if isinstance(last_sched_dt, datetime) and (last_sched_dt + timedelta(seconds=cfg.interval_seconds)) < min_next:
-                repaired_anchor = next_time - timedelta(seconds=cfg.interval_seconds)
+            cadence_next = _ensure_aware_utc(target_doc.get("cadence_next_at"))
+            if cadence_next is None:
+                # Back-compat: seed from last_scheduled_at if present, otherwise from min_next.
+                last_sched_dt = _ensure_aware_utc(target_doc.get("last_scheduled_at"))
+                if last_sched_dt is not None:
+                    cadence_next = max(min_next, last_sched_dt + timedelta(seconds=cfg.interval_seconds))
+                else:
+                    cadence_next = min_next
                 try:
                     await store.targets.update_one(
                         {"_id": target_key},
-                        {"$set": {"last_scheduled_at": repaired_anchor, "updated_at": now_utc()}},
-                    )
-                    logger.info(
-                        "scheduler: repaired last_scheduled_at for %s (old=%s new=%s)",
-                        target_key,
-                        last_sched_dt,
-                        repaired_anchor,
+                        {"$set": {"cadence_next_at": cadence_next, "updated_at": now_utc()}},
                     )
                 except Exception:
-                    logger.exception("scheduler: failed to repair last_scheduled_at for %s", target_key)
+                    logger.exception("scheduler: failed to initialize cadence_next_at for %s", target_key)
+
+            cadence_next = _roll_forward(cadence_next, min_dt=min_next, step_seconds=cfg.interval_seconds)
+            next_time = cadence_next
 
             # Schedule items until horizon
             while next_time <= horizon:
@@ -1079,7 +1094,13 @@ async def telegram_scheduler_loop(cfg: BacklogConfig, store: BacklogStore, app: 
                     )
                     await store.targets.update_one(
                         {"_id": target_key},
-                        {"$set": {"last_scheduled_at": next_time, "updated_at": now_utc()}},
+                        {
+                            "$set": {
+                                "last_scheduled_at": next_time,
+                                "cadence_next_at": next_time + timedelta(seconds=cfg.interval_seconds),
+                                "updated_at": now_utc(),
+                            }
+                        },
                     )
                     # increment next schedule slot
                     next_time = next_time + timedelta(seconds=cfg.interval_seconds)
