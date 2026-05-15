@@ -825,6 +825,13 @@ async def should_post_now(cfg: BacklogConfig, target_doc: Dict[str, Any]) -> boo
     else:
         last_dt = last
 
+    # PyMongo can return naive datetimes depending on client tz_aware settings.
+    # Our scheduler/time math uses aware UTC datetimes.
+    if not isinstance(last_dt, datetime):
+        return True
+    if last_dt.tzinfo is None:
+        last_dt = last_dt.replace(tzinfo=timezone.utc)
+
     due_at = last_dt + timedelta(seconds=cfg.interval_seconds)
     if now_utc() >= due_at:
         return True
