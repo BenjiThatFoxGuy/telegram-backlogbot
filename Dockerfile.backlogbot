@@ -1,0 +1,34 @@
+# Minimal container for backlogbot.py only (for easier debugging)
+# Uses the same Python major/minor as main image (3.10)
+FROM python:3.10-bullseye
+
+WORKDIR /userbot
+
+# System deps likely needed by some Python wheels / media handling.
+# (Keep small; add more only when needed.)
+RUN --mount=type=cache,target=/var/cache/apt \
+    --mount=type=cache,target=/var/lib/apt \
+    apt-get update ; \
+    apt-get install -y --no-install-recommends \
+    ffmpeg \
+    gcc \
+    ; \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies.
+COPY requirements.txt ./
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --upgrade pip setuptools wheel ; \
+    pip install -r requirements.txt ; \
+    # backlogbot uses Pyrogram Client, and this repo typically uses pyrofork.
+    # The main Dockerfile installs pyrofork from git; keep parity here.
+    pip install -U git+https://github.com/Mayuri-Chan/pyrofork
+
+# Copy only the pieces backlogbot needs.
+COPY backlogbot.py ./
+COPY async_pymongo.py ./
+
+# Use unbuffered logs so docker logs show immediately.
+ENV PYTHONUNBUFFERED=1
+
+CMD ["python3.10", "backlogbot.py"]

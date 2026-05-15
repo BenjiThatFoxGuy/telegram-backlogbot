@@ -22,6 +22,30 @@ logger = logging.getLogger("backlogbot")
 logging.basicConfig(level=logging.INFO)
 
 
+def _log_env_snapshot() -> None:
+    """Log a non-sensitive snapshot of runtime configuration inputs.
+
+    Intentionally avoids printing secrets.
+    """
+    def _present(name: str) -> str:
+        return "set" if os.getenv(name) not in (None, "") else "missing"
+
+    logger.info(
+        "Env snapshot: BACKLOG_ENABLE=%r BACKLOG_ROOT=%r BACKLOG_ARCHIVE_ROOT=%r BACKLOG_TARGETS=%r "
+        "BACKLOG_STATE_DB=%r MONGO_URL=%s TG_API_ID=%s TG_API_HASH=%s TG_PASSWORD=%s TZ=%r",
+        os.getenv("BACKLOG_ENABLE"),
+        os.getenv("BACKLOG_ROOT"),
+        os.getenv("BACKLOG_ARCHIVE_ROOT"),
+        os.getenv("BACKLOG_TARGETS"),
+        os.getenv("BACKLOG_STATE_DB"),
+        "set" if os.getenv("MONGO_URL") else "missing",
+        _present("TG_API_ID"),
+        _present("TG_API_HASH"),
+        _present("TG_PASSWORD"),
+        os.getenv("TZ"),
+    )
+
+
 # -----------------------------
 # Env / config
 # -----------------------------
@@ -128,6 +152,27 @@ def load_config() -> BacklogConfig:
 
     if cfg.use_telegram_scheduler and not schedule_ahead_raw:
         raise ValueError("BACKLOG_SCHEDULE_AHEAD is required when BACKLOG_USE_TELEGRAM_SCHEDULER=true")
+
+    logger.info(
+        "Config: enabled=%s root=%s archive=%s allowlist=%s scan_every=%ss settle=%ss interval=%ss scope=%s overdue=%s "
+        "success_action=%s scheduler=%s schedule_ahead=%ss min_schedule_delay=%ss max_failures=%s state_db=%s tz=%s",
+        cfg.enabled,
+        cfg.backlog_root,
+        cfg.archive_root,
+        cfg.targets_allowlist,
+        cfg.scan_every_seconds,
+        cfg.settle_seconds,
+        cfg.interval_seconds,
+        cfg.scope,
+        cfg.overdue,
+        cfg.success_action,
+        cfg.use_telegram_scheduler,
+        cfg.schedule_ahead_seconds,
+        cfg.min_schedule_delay_seconds,
+        cfg.max_failures,
+        cfg.backlog_state_db,
+        cfg.tz_name,
+    )
 
     return cfg
 
@@ -503,13 +548,30 @@ async def handle_success(cfg: BacklogConfig, *, target_key: str, media: Path, si
 
 async def scan_backlog(cfg: BacklogConfig, store: BacklogStore) -> None:
     """Scan BACKLOG_ROOT, discover stable media files, and enqueue them in DB."""
+    logger.debug("scan_backlog: starting scan")
     ensure_dir(cfg.backlog_root)
     allowlist = parse_allowlist(cfg.targets_allowlist)
 
     alias_map = build_allowlist_alias_map(allowlist)
 
-    for child in cfg.backlog_root.iterdir():
+    logger.info(
+        "scan_backlog: root=%s allowlist_count=%d allowlist=%s",
+        cfg.backlog_root,
+        len(allowlist),
+        allowlist,
+    )
+
+    try:
+        children = list(cfg.backlog_root.iterdir())
+    except Exception:
+        logger.exception("scan_backlog: failed to list backlog root %s", cfg.backlog_root)
+        return
+
+    logger.info("scan_backlog: found %d entries under root", len(children))
+
+    for child in children:
         if not child.is_dir():
+            logger.debug("scan_backlog: skipping non-dir %s", child)
             continue
 
         folder_name = child.name
@@ -521,6 +583,7 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore) -> None:
 
         looks_like_target = folder_name.startswith("@") or re.fullmatch(r"-?\d+", folder_name) is not None
         if not looks_like_target:
+            logger.info("scan_backlog: folder %s not target-like; quarantining files (if any)", folder_name)
             # Not a target-like folder; quarantine its contents.
             files = [p for p in child.iterdir() if p.is_file()]
             if files:
@@ -529,6 +592,10 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore) -> None:
 
         canonical_target = alias_map.get(folder_name)
         if canonical_target is None:
+            logger.info(
+                "scan_backlog: folder %s not allowlisted/mappable; quarantining files (if any)",
+                folder_name,
+            )
             # Folder exists but not allowlisted/mappable: quarantine contents.
             files = [p for p in child.iterdir() if p.is_file()]
             if files:
@@ -538,7 +605,20 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore) -> None:
         target_key = canonical_target
         await store.get_or_create_target(target_key)
 
-        for p in child.iterdir():
+        try:
+            folder_files = list(child.iterdir())
+        except Exception:
+            logger.exception("scan_backlog: failed to list folder %s", child)
+            continue
+
+        logger.info(
+            "scan_backlog: scanning target folder=%s (canonical=%s) entries=%d",
+            child,
+            target_key,
+            len(folder_files),
+        )
+
+        for p in folder_files:
             if not p.is_file():
                 continue
 
@@ -547,10 +627,12 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore) -> None:
                 continue
 
             if not is_stable_file(p, cfg.settle_seconds):
+                logger.debug("scan_backlog: file not settled yet: %s", p)
                 continue
 
             send_kind = pick_send_kind(p, cfg.allow_unknown_as_document)
             if send_kind is None:
+                logger.info("scan_backlog: disallowed filetype; quarantining: %s", p)
                 sidecar = caption_sidecar_for(p)
                 to_quarantine = [p] + ([sidecar] if sidecar.exists() else [])
                 await quarantine_paths(
@@ -565,7 +647,7 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore) -> None:
                 st = p.stat()
                 sha = compute_sha256(p)
                 rel_path = str(p.relative_to(cfg.backlog_root))
-                await store.upsert_item_discovered(
+                inserted = await store.upsert_item_discovered(
                     target_key=target_key,
                     rel_path=rel_path,
                     sha256=sha,
@@ -573,6 +655,17 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore) -> None:
                     mtime=float(st.st_mtime),
                     send_kind=send_kind,
                 )
+                if inserted:
+                    logger.info(
+                        "scan_backlog: enqueued target=%s rel=%s kind=%s size=%d sha=%s",
+                        target_key,
+                        rel_path,
+                        send_kind,
+                        int(st.st_size),
+                        sha[:12],
+                    )
+                else:
+                    logger.debug("scan_backlog: already enqueued (skip) target=%s rel=%s", target_key, rel_path)
             except Exception as e:
                 logger.exception("Failed to enqueue %s: %s", p, e)
 
@@ -697,11 +790,13 @@ async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client)
             await asyncio.sleep(5)
             continue
 
+        logger.debug("direct_post_loop: tick scope=%s", cfg.scope)
         await scan_backlog(cfg, store)
 
         if cfg.scope == "global":
             item = await store.get_next_due_item(target_key=None)
             if not item:
+                logger.debug("direct_post_loop: no due items (global)")
                 await asyncio.sleep(cfg.scan_every_seconds)
                 continue
 
@@ -714,15 +809,28 @@ async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client)
 
             target_doc = await store.get_or_create_target(target_key)
             if not await should_post_now(cfg, target_doc):
+                logger.debug("direct_post_loop: should_post_now=false for target=%s", target_key)
                 await asyncio.sleep(5)
                 continue
 
             peer_id = await resolve_peer_id(app, store, target_key, target_key)
             ok, msg_id, err = await send_one_item(cfg, store, app, item, peer_id)
             if ok:
+                logger.info(
+                    "direct_post_loop: posted target=%s rel=%s msg_id=%s",
+                    target_key,
+                    item.get("rel_path"),
+                    msg_id,
+                )
                 await store.set_item_status(item["_id"], "posted", posted_message_id=msg_id, posted_at=now_utc())
                 await store.targets.update_one({"_id": target_key}, {"$set": {"last_post_at": now_utc()}})
             else:
+                logger.warning(
+                    "direct_post_loop: send failed target=%s rel=%s err=%s",
+                    target_key,
+                    item.get("rel_path"),
+                    err,
+                )
                 updated = await store.bump_failure(item["_id"], err or "unknown", retry_after_seconds=cfg.scan_every_seconds)
                 if updated and int(updated.get("fail_count", 0)) >= cfg.max_failures:
                     # move file to failed archive bucket
@@ -739,18 +847,32 @@ async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client)
         for target_key in allowlist:
             target_doc = await store.get_or_create_target(target_key)
             if not await should_post_now(cfg, target_doc):
+                logger.debug("direct_post_loop: skip target=%s (not time yet)", target_key)
                 continue
 
             item = await store.get_next_due_item(target_key=target_key)
             if not item:
+                logger.debug("direct_post_loop: no due item for target=%s", target_key)
                 continue
 
             peer_id = await resolve_peer_id(app, store, target_key, target_key)
             ok, msg_id, err = await send_one_item(cfg, store, app, item, peer_id)
             if ok:
+                logger.info(
+                    "direct_post_loop: posted target=%s rel=%s msg_id=%s",
+                    target_key,
+                    item.get("rel_path"),
+                    msg_id,
+                )
                 await store.set_item_status(item["_id"], "posted", posted_message_id=msg_id, posted_at=now_utc())
                 await store.targets.update_one({"_id": target_key}, {"$set": {"last_post_at": now_utc()}})
             else:
+                logger.warning(
+                    "direct_post_loop: send failed target=%s rel=%s err=%s",
+                    target_key,
+                    item.get("rel_path"),
+                    err,
+                )
                 updated = await store.bump_failure(item["_id"], err or "unknown", retry_after_seconds=cfg.scan_every_seconds)
                 if updated and int(updated.get("fail_count", 0)) >= cfg.max_failures:
                     rel = updated["rel_path"]
@@ -875,6 +997,14 @@ async def telegram_scheduler_loop(cfg: BacklogConfig, store: BacklogStore, app: 
 
 
 async def main() -> None:
+    # Allow turning up verbosity without changing code
+    # (e.g. BACKLOG_LOG_LEVEL=DEBUG)
+    log_level = os.getenv("BACKLOG_LOG_LEVEL", "INFO").strip().upper()
+    logging.getLogger().setLevel(getattr(logging, log_level, logging.INFO))
+    logger.setLevel(getattr(logging, log_level, logging.INFO))
+
+    _log_env_snapshot()
+
     cfg = load_config()
     logger.info(
         "Starting backlogbot: enabled=%s scheduler=%s root=%s archive=%s allowlist=%d interval=%ss",
@@ -887,9 +1017,14 @@ async def main() -> None:
     )
 
     # Mongo
+    logger.info("Connecting to mongo (db=%s) ...", cfg.backlog_state_db)
     conn = AsyncClient(cfg.mongo_url)
     store = BacklogStore(conn, cfg.backlog_state_db)
-    await store.ensure_indexes()
+    try:
+        await store.ensure_indexes()
+        logger.info("Mongo indexes ensured")
+    except Exception:
+        logger.exception("Failed ensuring Mongo indexes")
 
     api_id = os.getenv("TG_API_ID")
     api_hash = os.getenv("TG_API_HASH")
@@ -918,6 +1053,7 @@ async def main() -> None:
     )
 
     async with app:
+        logger.info("Pyrogram client started")
         if not cfg.targets_allowlist:
             logger.warning("BACKLOG_TARGETS is empty; nothing will be posted")
 
