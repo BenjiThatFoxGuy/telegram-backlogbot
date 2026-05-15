@@ -1024,9 +1024,19 @@ async def telegram_scheduler_loop(cfg: BacklogConfig, store: BacklogStore, app: 
             else:
                 last_sched_dt = last_sched
 
+            # Normalize naive datetimes returned by Mongo depending on tz_aware settings.
+            if isinstance(last_sched_dt, datetime) and last_sched_dt.tzinfo is None:
+                last_sched_dt = last_sched_dt.replace(tzinfo=timezone.utc)
+
+            # Always schedule in the future. If we restart and last_scheduled_at is far in the past,
+            # fast-forward the anchor to now + min_delay so we don't pile messages onto an old time.
+            min_next = now_utc() + timedelta(seconds=cfg.min_schedule_delay_seconds)
+            if isinstance(last_sched_dt, datetime) and last_sched_dt < min_next:
+                last_sched_dt = min_next
+
             next_time = max(
-                now_utc() + timedelta(seconds=cfg.min_schedule_delay_seconds),
-                (last_sched_dt + timedelta(seconds=cfg.interval_seconds)) if last_sched_dt else now_utc() + timedelta(seconds=cfg.min_schedule_delay_seconds),
+                min_next,
+                (last_sched_dt + timedelta(seconds=cfg.interval_seconds)) if last_sched_dt else min_next,
             )
 
             # Schedule items until horizon
