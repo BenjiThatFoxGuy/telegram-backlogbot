@@ -151,6 +151,7 @@ class BacklogConfig:
     allow_unknown_as_document: bool
 
     use_telegram_scheduler: bool
+    scheduler_mode: str  # fixed_cadence|legacy
     schedule_ahead_seconds: int
     min_schedule_delay_seconds: int
 
@@ -171,6 +172,7 @@ def load_config() -> BacklogConfig:
 
     use_scheduler = _env_bool("BACKLOG_USE_TELEGRAM_SCHEDULER", False)
     schedule_ahead_raw = _env_str("BACKLOG_SCHEDULE_AHEAD", "7d")
+    scheduler_mode = _env_str("BACKLOG_SCHEDULER_MODE", "fixed_cadence").strip()
 
     cfg = BacklogConfig(
         enabled=_env_bool("BACKLOG_ENABLE", True),
@@ -185,6 +187,7 @@ def load_config() -> BacklogConfig:
         success_action=_env_str("BACKLOG_SUCCESS_ACTION", "delete").strip(),
         allow_unknown_as_document=_env_bool("BACKLOG_ALLOW_UNKNOWN_AS_DOCUMENT", False),
         use_telegram_scheduler=use_scheduler,
+        scheduler_mode=scheduler_mode,
         schedule_ahead_seconds=parse_duration_to_seconds(schedule_ahead_raw),
         min_schedule_delay_seconds=_env_int("BACKLOG_MIN_SCHEDULE_DELAY_SECONDS", 120),
         max_failures=_env_int("BACKLOG_MAX_FAILURES", 5),
@@ -203,9 +206,12 @@ def load_config() -> BacklogConfig:
     if cfg.use_telegram_scheduler and not schedule_ahead_raw:
         raise ValueError("BACKLOG_SCHEDULE_AHEAD is required when BACKLOG_USE_TELEGRAM_SCHEDULER=true")
 
+    if cfg.scheduler_mode not in {"fixed_cadence", "legacy"}:
+        raise ValueError("BACKLOG_SCHEDULER_MODE must be 'fixed_cadence' or 'legacy'")
+
     logger.info(
         "Config: enabled=%s root=%s archive=%s allowlist=%s scan_every=%ss settle=%ss interval=%ss scope=%s overdue=%s "
-        "success_action=%s scheduler=%s schedule_ahead=%ss min_schedule_delay=%ss max_failures=%s state_db=%s tz=%s",
+        "success_action=%s scheduler=%s scheduler_mode=%s schedule_ahead=%ss min_schedule_delay=%ss max_failures=%s state_db=%s tz=%s",
         cfg.enabled,
         cfg.backlog_root,
         cfg.archive_root,
@@ -217,6 +223,7 @@ def load_config() -> BacklogConfig:
         cfg.overdue,
         cfg.success_action,
         cfg.use_telegram_scheduler,
+        cfg.scheduler_mode,
         cfg.schedule_ahead_seconds,
         cfg.min_schedule_delay_seconds,
         cfg.max_failures,
@@ -1044,31 +1051,34 @@ async def telegram_scheduler_loop(cfg: BacklogConfig, store: BacklogStore, app: 
             target_doc = await store.get_or_create_target(target_key)
             peer_id = await resolve_peer_id(app, store, target_key, target_key)
 
-            # -----------------------------
-            # Fixed cadence scheduling (Semantics A)
-            # -----------------------------
-            # cadence_next_at is the persisted "next slot". It survives restarts.
-            # On each loop we ensure it's at least now+min_delay, rolling forward by interval.
             min_next = now_utc() + timedelta(seconds=cfg.min_schedule_delay_seconds)
 
-            cadence_next = _ensure_aware_utc(target_doc.get("cadence_next_at"))
-            if cadence_next is None:
-                # Back-compat: seed from last_scheduled_at if present, otherwise from min_next.
-                last_sched_dt = _ensure_aware_utc(target_doc.get("last_scheduled_at"))
-                if last_sched_dt is not None:
-                    cadence_next = max(min_next, last_sched_dt + timedelta(seconds=cfg.interval_seconds))
-                else:
-                    cadence_next = min_next
-                try:
-                    await store.targets.update_one(
-                        {"_id": target_key},
-                        {"$set": {"cadence_next_at": cadence_next, "updated_at": now_utc()}},
-                    )
-                except Exception:
-                    logger.exception("scheduler: failed to initialize cadence_next_at for %s", target_key)
+            if cfg.scheduler_mode == "fixed_cadence":
+                # cadence_next_at is the persisted "next slot". It survives restarts.
+                # On each loop we ensure it's at least now+min_delay, rolling forward by interval.
+                cadence_next = _ensure_aware_utc(target_doc.get("cadence_next_at"))
+                if cadence_next is None:
+                    # Back-compat: seed from last_scheduled_at if present, otherwise from min_next.
+                    last_sched_dt = _ensure_aware_utc(target_doc.get("last_scheduled_at"))
+                    if last_sched_dt is not None:
+                        cadence_next = max(min_next, last_sched_dt + timedelta(seconds=cfg.interval_seconds))
+                    else:
+                        cadence_next = min_next
+                    try:
+                        await store.targets.update_one(
+                            {"_id": target_key},
+                            {"$set": {"cadence_next_at": cadence_next, "updated_at": now_utc()}},
+                        )
+                    except Exception:
+                        logger.exception("scheduler: failed to initialize cadence_next_at for %s", target_key)
 
-            cadence_next = _roll_forward(cadence_next, min_dt=min_next, step_seconds=cfg.interval_seconds)
-            next_time = cadence_next
+                cadence_next = _roll_forward(cadence_next, min_dt=min_next, step_seconds=cfg.interval_seconds)
+                next_time = cadence_next
+            else:
+                # Legacy behavior: schedule based on last_scheduled_at, but clamp into the future.
+                last_sched_dt = _ensure_aware_utc(target_doc.get("last_scheduled_at"))
+                candidate = (last_sched_dt + timedelta(seconds=cfg.interval_seconds)) if last_sched_dt else None
+                next_time = max(min_next, candidate) if candidate else min_next
 
             # Schedule items until horizon
             while next_time <= horizon:
@@ -1097,7 +1107,11 @@ async def telegram_scheduler_loop(cfg: BacklogConfig, store: BacklogStore, app: 
                         {
                             "$set": {
                                 "last_scheduled_at": next_time,
-                                "cadence_next_at": next_time + timedelta(seconds=cfg.interval_seconds),
+                                **(
+                                    {"cadence_next_at": next_time + timedelta(seconds=cfg.interval_seconds)}
+                                    if cfg.scheduler_mode == "fixed_cadence"
+                                    else {}
+                                ),
                                 "updated_at": now_utc(),
                             }
                         },
