@@ -154,6 +154,10 @@ class BacklogConfig:
     # If true, do not quarantine files for non-allowlisted targets; just ignore them.
     skip_quarantine_unmapped_targets: bool
 
+    # Direct-post mode convenience: if true, allow posting one item immediately per target
+    # when the process starts, even if BACKLOG_INTERVAL_SECONDS hasn't elapsed yet.
+    immediate_post_on_start: bool
+
     use_telegram_scheduler: bool
     scheduler_mode: str  # fixed_cadence|legacy
     schedule_ahead_seconds: int
@@ -195,6 +199,11 @@ def load_config() -> BacklogConfig:
             "BACKLOG_SKIP_QUARANTINE_UNMAPPED_TARGETS",
             False,
         ),
+
+        immediate_post_on_start=_env_bool(
+            "BACKLOG_IMMEDIATE_POST_ON_START",
+            False,
+        ),
         use_telegram_scheduler=use_scheduler,
         scheduler_mode=scheduler_mode,
         schedule_ahead_seconds=parse_duration_to_seconds(schedule_ahead_raw),
@@ -221,7 +230,7 @@ def load_config() -> BacklogConfig:
     logger.info(
         "Config: enabled=%s root=%s archive=%s allowlist=%s scan_every=%ss settle=%ss interval=%ss scope=%s overdue=%s "
         "success_action=%s allow_unknown_as_document=%s skip_quarantine_unmapped_targets=%s "
-        "scheduler=%s scheduler_mode=%s schedule_ahead=%ss min_schedule_delay=%ss max_failures=%s state_db=%s tz=%s",
+        "immediate_post_on_start=%s scheduler=%s scheduler_mode=%s schedule_ahead=%ss min_schedule_delay=%ss max_failures=%s state_db=%s tz=%s",
         cfg.enabled,
         cfg.backlog_root,
         cfg.archive_root,
@@ -234,6 +243,7 @@ def load_config() -> BacklogConfig:
         cfg.success_action,
         cfg.allow_unknown_as_document,
         cfg.skip_quarantine_unmapped_targets,
+        cfg.immediate_post_on_start,
         cfg.use_telegram_scheduler,
         cfg.scheduler_mode,
         cfg.schedule_ahead_seconds,
@@ -951,6 +961,11 @@ async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client)
     allowlist = parse_allowlist(cfg.targets_allowlist)
     alias_map = build_allowlist_alias_map(allowlist)
 
+    # Optionally allow a one-time "kick" at startup: post one item per target immediately,
+    # even if last_post_at cadence says we should wait. This helps after restarts.
+    started_at = now_utc()
+    posted_immediately_for: set[str] = set()
+
     while True:
         if not cfg.enabled:
             await asyncio.sleep(5)
@@ -1013,6 +1028,53 @@ async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client)
         for target_key in allowlist:
             target_doc = await store.get_or_create_target(target_key)
             if not await should_post_now(cfg, target_doc):
+                # Startup kick: allow one immediate post per target if there is something queued.
+                if (
+                    cfg.immediate_post_on_start
+                    and target_key not in posted_immediately_for
+                    and (now_utc() - started_at).total_seconds() <= max(30, cfg.scan_every_seconds * 2)
+                ):
+                    item = await store.get_next_due_item(target_key=target_key)
+                    if item:
+                        logger.info(
+                            "direct_post_loop: immediate startup post for target=%s rel=%s",
+                            target_key,
+                            item.get("rel_path"),
+                        )
+                        peer_id = await resolve_peer_id(app, store, target_key, target_key)
+                        ok, msg_id, err = await send_one_item(cfg, store, app, item, peer_id)
+                        posted_immediately_for.add(target_key)
+                        if ok:
+                            logger.info(
+                                "direct_post_loop: posted (startup) target=%s rel=%s msg_id=%s",
+                                target_key,
+                                item.get("rel_path"),
+                                msg_id,
+                            )
+                            await store.set_item_status(item["_id"], "posted", posted_message_id=msg_id, posted_at=now_utc())
+                            await store.targets.update_one({"_id": target_key}, {"$set": {"last_post_at": now_utc()}})
+                        else:
+                            logger.warning(
+                                "direct_post_loop: send failed (startup) target=%s rel=%s err=%s",
+                                target_key,
+                                item.get("rel_path"),
+                                err,
+                            )
+                            updated = await store.bump_failure(
+                                item["_id"],
+                                err or "unknown",
+                                retry_after_seconds=cfg.scan_every_seconds,
+                            )
+                            if updated and int(updated.get("fail_count", 0)) >= cfg.max_failures:
+                                rel = updated["rel_path"]
+                                media = cfg.backlog_root / rel
+                                sidecar = caption_sidecar_for(media)
+                                paths = [media] + ([sidecar] if sidecar.exists() else [])
+                                await archive_paths(cfg, bucket="_failed", target_key=target_key, paths=paths)
+                                await store.set_item_status(item["_id"], "failed")
+                        # Continue to next target; do not also run defer logic this tick.
+                        continue
+
                 due_at = next_post_due_at(cfg, target_doc)
                 # Keep DB semantics accurate: items shouldn't appear "due now" when we're
                 # intentionally rate-limiting per target.
