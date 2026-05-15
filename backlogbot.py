@@ -151,6 +151,9 @@ class BacklogConfig:
 
     allow_unknown_as_document: bool
 
+    # If true, do not quarantine files for non-allowlisted targets; just ignore them.
+    skip_quarantine_unmapped_targets: bool
+
     use_telegram_scheduler: bool
     scheduler_mode: str  # fixed_cadence|legacy
     schedule_ahead_seconds: int
@@ -187,6 +190,11 @@ def load_config() -> BacklogConfig:
         overdue=_env_str("BACKLOG_OVERDUE", "post_once").strip(),
         success_action=_env_str("BACKLOG_SUCCESS_ACTION", "delete").strip(),
         allow_unknown_as_document=_env_bool("BACKLOG_ALLOW_UNKNOWN_AS_DOCUMENT", False),
+
+        skip_quarantine_unmapped_targets=_env_bool(
+            "BACKLOG_SKIP_QUARANTINE_UNMAPPED_TARGETS",
+            False,
+        ),
         use_telegram_scheduler=use_scheduler,
         scheduler_mode=scheduler_mode,
         schedule_ahead_seconds=parse_duration_to_seconds(schedule_ahead_raw),
@@ -212,7 +220,8 @@ def load_config() -> BacklogConfig:
 
     logger.info(
         "Config: enabled=%s root=%s archive=%s allowlist=%s scan_every=%ss settle=%ss interval=%ss scope=%s overdue=%s "
-        "success_action=%s scheduler=%s scheduler_mode=%s schedule_ahead=%ss min_schedule_delay=%ss max_failures=%s state_db=%s tz=%s",
+        "success_action=%s allow_unknown_as_document=%s skip_quarantine_unmapped_targets=%s "
+        "scheduler=%s scheduler_mode=%s schedule_ahead=%ss min_schedule_delay=%ss max_failures=%s state_db=%s tz=%s",
         cfg.enabled,
         cfg.backlog_root,
         cfg.archive_root,
@@ -223,6 +232,8 @@ def load_config() -> BacklogConfig:
         cfg.scope,
         cfg.overdue,
         cfg.success_action,
+        cfg.allow_unknown_as_document,
+        cfg.skip_quarantine_unmapped_targets,
         cfg.use_telegram_scheduler,
         cfg.scheduler_mode,
         cfg.schedule_ahead_seconds,
@@ -683,23 +694,35 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore) -> None:
 
         looks_like_target = folder_name.startswith("@") or re.fullmatch(r"-?\d+", folder_name) is not None
         if not looks_like_target:
-            logger.info("scan_backlog: folder %s not target-like; quarantining files (if any)", folder_name)
-            # Not a target-like folder; quarantine its contents.
-            files = [p for p in child.iterdir() if p.is_file()]
-            if files:
-                await quarantine_paths(cfg, reason="unmapped_target", target_bucket=folder_name, paths=files)
+            if cfg.skip_quarantine_unmapped_targets:
+                logger.info(
+                    "scan_backlog: folder %s not target-like; skipping quarantine (config)",
+                    folder_name,
+                )
+            else:
+                logger.info("scan_backlog: folder %s not target-like; quarantining files (if any)", folder_name)
+                # Not a target-like folder; quarantine its contents.
+                files = [p for p in child.iterdir() if p.is_file()]
+                if files:
+                    await quarantine_paths(cfg, reason="unmapped_target", target_bucket=folder_name, paths=files)
             continue
 
         canonical_target = alias_map.get(folder_name)
         if canonical_target is None:
-            logger.info(
-                "scan_backlog: folder %s not allowlisted/mappable; quarantining files (if any)",
-                folder_name,
-            )
-            # Folder exists but not allowlisted/mappable: quarantine contents.
-            files = [p for p in child.iterdir() if p.is_file()]
-            if files:
-                await quarantine_paths(cfg, reason="unmapped_target", target_bucket=folder_name, paths=files)
+            if cfg.skip_quarantine_unmapped_targets:
+                logger.info(
+                    "scan_backlog: folder %s not allowlisted/mappable; skipping quarantine (config)",
+                    folder_name,
+                )
+            else:
+                logger.info(
+                    "scan_backlog: folder %s not allowlisted/mappable; quarantining files (if any)",
+                    folder_name,
+                )
+                # Folder exists but not allowlisted/mappable: quarantine contents.
+                files = [p for p in child.iterdir() if p.is_file()]
+                if files:
+                    await quarantine_paths(cfg, reason="unmapped_target", target_bucket=folder_name, paths=files)
             continue
 
         target_key = canonical_target
