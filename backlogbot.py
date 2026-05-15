@@ -381,6 +381,11 @@ class BacklogStore:
             await self.items.create_index([("target_key", 1), ("seq", 1)], unique=True)
         except Exception:
             pass
+        # Speed up de-dup checks (same content re-appearing under different filenames)
+        try:
+            await self.items.create_index([("target_key", 1), ("sha256", 1)])
+        except Exception:
+            pass
         try:
             await self.items.create_index([("sha256", 1)])
         except Exception:
@@ -389,6 +394,21 @@ class BacklogStore:
             await self.items.create_index([("status", 1), ("next_attempt_at", 1)])
         except Exception:
             pass
+
+    async def find_duplicate_content_item(self, *, target_key: str, sha256: str) -> Optional[Dict[str, Any]]:
+        """Return an existing item with the same content hash for this target.
+
+        We consider pending/scheduled/posted as "already accounted for" so a newly
+        discovered file with the same sha should be treated as a duplicate.
+        """
+        return await self.items.find_one(
+            {
+                "target_key": target_key,
+                "sha256": sha256,
+                "status": {"$in": ["pending", "scheduled", "posted"]},
+            },
+            projection={"_id": 1, "rel_path": 1, "status": 1, "posted_message_id": 1, "scheduled_message_id": 1},
+        )
 
     async def get_or_create_target(self, target_key: str) -> Dict[str, Any]:
         doc = await self.targets.find_one({"_id": target_key})
@@ -853,6 +873,36 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore, app: Optional[Cl
                 logger.debug("scan_backlog: file not settled yet: %s", p)
                 continue
 
+            # De-dup by content hash per target: if this exact file content has already
+            # been seen (pending/scheduled/posted), quarantine the newly discovered file
+            # so it doesn't get reposted.
+            try:
+                sha_for_dedup = compute_sha256(p)
+                dup = await store.find_duplicate_content_item(target_key=target_key, sha256=sha_for_dedup)
+            except Exception as e:
+                logger.warning("scan_backlog: failed duplicate check for %s: %s", p, e)
+                dup = None
+                sha_for_dedup = None
+
+            if dup:
+                logger.info(
+                    "scan_backlog: duplicate content; quarantining target=%s rel=%s sha=%s existing_status=%s existing_rel=%s",
+                    target_key,
+                    str(p.relative_to(cfg.backlog_root)),
+                    (sha_for_dedup or "")[:12],
+                    dup.get("status"),
+                    dup.get("rel_path"),
+                )
+                sidecar = caption_sidecar_for(p)
+                to_quarantine = [p] + ([sidecar] if sidecar.exists() else [])
+                await quarantine_paths(
+                    cfg,
+                    reason="duplicate",
+                    target_bucket=target_key,
+                    paths=to_quarantine,
+                )
+                continue
+
             send_kind = pick_send_kind(p, cfg.allow_unknown_as_document)
             if send_kind is None:
                 logger.info("scan_backlog: disallowed filetype; quarantining: %s", p)
@@ -868,7 +918,8 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore, app: Optional[Cl
 
             try:
                 st = p.stat()
-                sha = compute_sha256(p)
+                # Reuse the earlier hash if we already computed it for dedupe.
+                sha = sha_for_dedup or compute_sha256(p)
                 rel_path = str(p.relative_to(cfg.backlog_root))
                 inserted = await store.upsert_item_discovered(
                     target_key=target_key,
