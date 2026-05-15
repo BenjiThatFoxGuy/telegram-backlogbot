@@ -511,6 +511,21 @@ def _roll_forward(dt: datetime, *, min_dt: datetime, step_seconds: int) -> datet
         steps += 1
     return dt + timedelta(seconds=steps * step_seconds)
 
+
+def _ceil_to_minute(dt: datetime) -> datetime:
+    """Ceil a datetime to the next whole minute boundary (UTC-aware expected).
+
+    Telegram's native scheduler behaves at minute granularity; scheduling inside the
+    current minute can lead to messages being scheduled "for the minute it started",
+    which may already be in the past by the time Telegram processes it.
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    if dt.second == 0 and dt.microsecond == 0:
+        return dt
+    base = dt.replace(second=0, microsecond=0)
+    return base + timedelta(minutes=1)
+
 def build_allowlist_alias_map(allowlist: List[str]) -> Dict[str, str]:
     """Return mapping of alias->canonical allowlist token.
 
@@ -1068,7 +1083,9 @@ async def telegram_scheduler_loop(cfg: BacklogConfig, store: BacklogStore, app: 
             target_doc = await store.get_or_create_target(target_key)
             peer_id = await resolve_peer_id(app, store, target_key, target_key)
 
-            min_next = now_utc() + timedelta(seconds=cfg.min_schedule_delay_seconds)
+            # Telegram scheduling is effectively minute-granular; avoid scheduling within the
+            # current minute on startup by rounding up to the next minute boundary.
+            min_next = _ceil_to_minute(now_utc() + timedelta(seconds=cfg.min_schedule_delay_seconds))
 
             if cfg.scheduler_mode == "fixed_cadence":
                 # cadence_next_at is the persisted "next slot". It survives restarts.
@@ -1090,12 +1107,12 @@ async def telegram_scheduler_loop(cfg: BacklogConfig, store: BacklogStore, app: 
                         logger.exception("scheduler: failed to initialize cadence_next_at for %s", target_key)
 
                 cadence_next = _roll_forward(cadence_next, min_dt=min_next, step_seconds=cfg.interval_seconds)
-                next_time = cadence_next
+                next_time = _ceil_to_minute(cadence_next)
             else:
                 # Legacy behavior: schedule based on last_scheduled_at, but clamp into the future.
                 last_sched_dt = _ensure_aware_utc(target_doc.get("last_scheduled_at"))
                 candidate = (last_sched_dt + timedelta(seconds=cfg.interval_seconds)) if last_sched_dt else None
-                next_time = max(min_next, candidate) if candidate else min_next
+                next_time = max(min_next, _ceil_to_minute(candidate)) if candidate else min_next
 
             # Schedule items until horizon
             while next_time <= horizon:
@@ -1134,7 +1151,7 @@ async def telegram_scheduler_loop(cfg: BacklogConfig, store: BacklogStore, app: 
                         },
                     )
                     # increment next schedule slot
-                    next_time = next_time + timedelta(seconds=cfg.interval_seconds)
+                    next_time = _ceil_to_minute(next_time + timedelta(seconds=cfg.interval_seconds))
                 else:
                     updated = await store.bump_failure(item["_id"], err or "unknown", retry_after_seconds=cfg.scan_every_seconds)
                     if updated and int(updated.get("fail_count", 0)) >= cfg.max_failures:
