@@ -387,36 +387,6 @@ class BacklogStore:
         await self.targets.insert_one(doc)
         return doc
 
-
-def _ensure_aware_utc(dt: Any) -> Optional[datetime]:
-    """Best-effort normalize datetime to timezone-aware UTC."""
-    if dt is None:
-        return None
-    if isinstance(dt, str):
-        try:
-            parsed = datetime.fromisoformat(dt)
-        except Exception:
-            return None
-        dt = parsed
-    if not isinstance(dt, datetime):
-        return None
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
-def _roll_forward(dt: datetime, *, min_dt: datetime, step_seconds: int) -> datetime:
-    """Roll dt forward by N*step until dt >= min_dt (dt is returned unchanged if already >=)."""
-    if dt >= min_dt:
-        return dt
-    if step_seconds <= 0:
-        return min_dt
-    delta = (min_dt - dt).total_seconds()
-    steps = int(delta // step_seconds)
-    if dt + timedelta(seconds=steps * step_seconds) < min_dt:
-        steps += 1
-    return dt + timedelta(seconds=steps * step_seconds)
-
     async def set_target_peer_id(self, target_key: str, peer_id: int) -> None:
         await self.targets.update_one(
             {"_id": target_key},
@@ -500,6 +470,36 @@ def _roll_forward(dt: datetime, *, min_dt: datetime, step_seconds: int) -> datet
             },
         )
         return await self.items.find_one({"_id": item_id})
+
+
+def _ensure_aware_utc(dt: Any) -> Optional[datetime]:
+    """Best-effort normalize datetime to timezone-aware UTC."""
+    if dt is None:
+        return None
+    if isinstance(dt, str):
+        try:
+            parsed = datetime.fromisoformat(dt)
+        except Exception:
+            return None
+        dt = parsed
+    if not isinstance(dt, datetime):
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _roll_forward(dt: datetime, *, min_dt: datetime, step_seconds: int) -> datetime:
+    """Roll dt forward by N*step until dt >= min_dt (dt is returned unchanged if already >=)."""
+    if dt >= min_dt:
+        return dt
+    if step_seconds <= 0:
+        return min_dt
+    delta = (min_dt - dt).total_seconds()
+    steps = int(delta // step_seconds)
+    if dt + timedelta(seconds=steps * step_seconds) < min_dt:
+        steps += 1
+    return dt + timedelta(seconds=steps * step_seconds)
 
 
 def build_allowlist_alias_map(allowlist: List[str]) -> Dict[str, str]:
