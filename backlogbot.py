@@ -482,6 +482,22 @@ class BacklogStore:
             },
         )
         return await self.items.find_one({"_id": item_id})
+
+    async def defer_pending_items_until(self, *, target_key: str, when: datetime) -> None:
+        """Move pending items' next_attempt_at forward to `when` (per-target).
+
+        This is used in direct-post mode to avoid leaving pending items "due now" when
+        the cadence gate (last_post_at + interval) says we shouldn't post yet.
+        """
+        when = _ensure_aware_utc(when) or now_utc()
+        await self.items.update_many(
+            {
+                "target_key": target_key,
+                "status": "pending",
+                "next_attempt_at": {"$lt": when},
+            },
+            {"$set": {"next_attempt_at": when, "updated_at": now_utc()}},
+        )
 def _ensure_aware_utc(dt: Any) -> Optional[datetime]:
     """Best-effort normalize datetime to timezone-aware UTC."""
     if dt is None:
@@ -903,30 +919,32 @@ async def send_one_item(
 
 
 async def should_post_now(cfg: BacklogConfig, target_doc: Dict[str, Any]) -> bool:
+    return now_utc() >= next_post_due_at(cfg, target_doc)
+
+
+def next_post_due_at(cfg: BacklogConfig, target_doc: Dict[str, Any]) -> datetime:
+    """Return the next time we're allowed to post for this target in direct mode."""
     last = target_doc.get("last_post_at")
     if last is None:
-        return True
+        return now_utc()
+
     if isinstance(last, str):
         # tolerate older formats
         try:
             last_dt = datetime.fromisoformat(last)
-            if last_dt.tzinfo is None:
-                last_dt = last_dt.replace(tzinfo=timezone.utc)
         except Exception:
-            return True
+            return now_utc()
     else:
         last_dt = last
 
-    # PyMongo can return naive datetimes depending on client tz_aware settings.
-    # Our scheduler/time math uses aware UTC datetimes.
     if not isinstance(last_dt, datetime):
-        return True
+        return now_utc()
+
+    # PyMongo can return naive datetimes depending on client tz_aware settings.
     if last_dt.tzinfo is None:
         last_dt = last_dt.replace(tzinfo=timezone.utc)
-    due_at = last_dt + timedelta(seconds=cfg.interval_seconds)
-    if now_utc() >= due_at:
-        return True
-    return False
+
+    return last_dt + timedelta(seconds=cfg.interval_seconds)
 
 
 async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client) -> None:
@@ -995,7 +1013,19 @@ async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client)
         for target_key in allowlist:
             target_doc = await store.get_or_create_target(target_key)
             if not await should_post_now(cfg, target_doc):
-                logger.debug("direct_post_loop: skip target=%s (not time yet)", target_key)
+                due_at = next_post_due_at(cfg, target_doc)
+                # Keep DB semantics accurate: items shouldn't appear "due now" when we're
+                # intentionally rate-limiting per target.
+                try:
+                    await store.defer_pending_items_until(target_key=target_key, when=due_at)
+                except Exception:
+                    logger.exception("direct_post_loop: failed deferring pending items for target=%s", target_key)
+
+                logger.debug(
+                    "direct_post_loop: skip target=%s (not time yet; next_due=%s)",
+                    target_key,
+                    due_at,
+                )
                 continue
 
             item = await store.get_next_due_item(target_key=target_key)
