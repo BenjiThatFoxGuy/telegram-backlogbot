@@ -395,11 +395,11 @@ class BacklogStore:
         except Exception:
             pass
 
-    async def find_duplicate_content_item(self, *, target_key: str, sha256: str) -> Optional[Dict[str, Any]]:
+    async def find_existing_content_item(self, *, target_key: str, sha256: str) -> Optional[Dict[str, Any]]:
         """Return an existing item with the same content hash for this target.
 
-        We consider pending/scheduled/posted as "already accounted for" so a newly
-        discovered file with the same sha should be treated as a duplicate.
+        Used for de-duplication decisions. Note that callers may choose to quarantine
+        only when the existing item is already posted.
         """
         return await self.items.find_one(
             {
@@ -407,7 +407,13 @@ class BacklogStore:
                 "sha256": sha256,
                 "status": {"$in": ["pending", "scheduled", "posted"]},
             },
-            projection={"_id": 1, "rel_path": 1, "status": 1, "posted_message_id": 1, "scheduled_message_id": 1},
+            projection={
+                "_id": 1,
+                "rel_path": 1,
+                "status": 1,
+                "posted_message_id": 1,
+                "scheduled_message_id": 1,
+            },
         )
 
     async def get_or_create_target(self, target_key: str) -> Dict[str, Any]:
@@ -873,25 +879,26 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore, app: Optional[Cl
                 logger.debug("scan_backlog: file not settled yet: %s", p)
                 continue
 
-            # De-dup by content hash per target: if this exact file content has already
-            # been seen (pending/scheduled/posted), quarantine the newly discovered file
-            # so it doesn't get reposted.
+            # De-dup by content hash per target.
+            # IMPORTANT: only quarantine when we know the content was already POSTED.
+            # If the existing item is merely pending/scheduled, it's not a true duplicate
+            # yet (it might never get posted), so we leave this file alone.
             try:
                 sha_for_dedup = compute_sha256(p)
-                dup = await store.find_duplicate_content_item(target_key=target_key, sha256=sha_for_dedup)
+                existing = await store.find_existing_content_item(target_key=target_key, sha256=sha_for_dedup)
             except Exception as e:
                 logger.warning("scan_backlog: failed duplicate check for %s: %s", p, e)
-                dup = None
+                existing = None
                 sha_for_dedup = None
 
-            if dup:
+            if existing and existing.get("status") == "posted":
                 logger.info(
                     "scan_backlog: duplicate content; quarantining target=%s rel=%s sha=%s existing_status=%s existing_rel=%s",
                     target_key,
                     str(p.relative_to(cfg.backlog_root)),
                     (sha_for_dedup or "")[:12],
-                    dup.get("status"),
-                    dup.get("rel_path"),
+                    existing.get("status"),
+                    existing.get("rel_path"),
                 )
                 sidecar = caption_sidecar_for(p)
                 to_quarantine = [p] + ([sidecar] if sidecar.exists() else [])
@@ -902,6 +909,15 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore, app: Optional[Cl
                     paths=to_quarantine,
                 )
                 continue
+            elif existing:
+                logger.debug(
+                    "scan_backlog: duplicate content but existing_status=%s (not quarantining) target=%s rel=%s sha=%s existing_rel=%s",
+                    existing.get("status"),
+                    target_key,
+                    str(p.relative_to(cfg.backlog_root)),
+                    (sha_for_dedup or "")[:12],
+                    existing.get("rel_path"),
+                )
 
             send_kind = pick_send_kind(p, cfg.allow_unknown_as_document)
             if send_kind is None:
