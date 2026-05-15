@@ -1028,16 +1028,32 @@ async def telegram_scheduler_loop(cfg: BacklogConfig, store: BacklogStore, app: 
             if isinstance(last_sched_dt, datetime) and last_sched_dt.tzinfo is None:
                 last_sched_dt = last_sched_dt.replace(tzinfo=timezone.utc)
 
-            # Always schedule in the future. If we restart and last_scheduled_at is far in the past,
-            # fast-forward the anchor to now + min_delay so we don't pile messages onto an old time.
+            # Always schedule in the future.
+            # If we restart and last_scheduled_at is far in the past, we want the *next* schedule
+            # time to be at least (now + min_delay) rather than piling messages onto an old time.
             min_next = now_utc() + timedelta(seconds=cfg.min_schedule_delay_seconds)
-            if isinstance(last_sched_dt, datetime) and last_sched_dt < min_next:
-                last_sched_dt = min_next
 
-            next_time = max(
-                min_next,
-                (last_sched_dt + timedelta(seconds=cfg.interval_seconds)) if last_sched_dt else min_next,
-            )
+            candidate = (last_sched_dt + timedelta(seconds=cfg.interval_seconds)) if isinstance(last_sched_dt, datetime) else None
+            next_time = max(min_next, candidate) if candidate else min_next
+
+            # DB repair: if stored last_scheduled_at would cause scheduling in the past, bump it forward
+            # so future container restarts don't keep anchoring on an ancient timestamp.
+            # We set it such that last_scheduled_at + interval == next_time.
+            if isinstance(last_sched_dt, datetime) and (last_sched_dt + timedelta(seconds=cfg.interval_seconds)) < min_next:
+                repaired_anchor = next_time - timedelta(seconds=cfg.interval_seconds)
+                try:
+                    await store.targets.update_one(
+                        {"_id": target_key},
+                        {"$set": {"last_scheduled_at": repaired_anchor, "updated_at": now_utc()}},
+                    )
+                    logger.info(
+                        "scheduler: repaired last_scheduled_at for %s (old=%s new=%s)",
+                        target_key,
+                        last_sched_dt,
+                        repaired_anchor,
+                    )
+                except Exception:
+                    logger.exception("scheduler: failed to repair last_scheduled_at for %s", target_key)
 
             # Schedule items until horizon
             while next_time <= horizon:
