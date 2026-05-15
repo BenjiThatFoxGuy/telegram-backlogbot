@@ -570,20 +570,29 @@ def build_allowlist_alias_map(allowlist: List[str]) -> Dict[str, str]:
 
     for canonical in allowlist:
         _add(canonical, canonical)
+
+        # Username-ish aliases:
+        # If user configured '@name', also accept 'name'.
+        # If user configured 'name' (without @), also accept '@name'.
         if canonical.startswith("@"):  # username
             _add(canonical[1:], canonical)
-        else:
-            # numeric-ish
-            try:
-                n = int(canonical)
-                s = str(n)
-                _add(s, canonical)
-                if s.startswith("-100"):
-                    _add(s.replace("-100", "", 1), canonical)
-                else:
-                    _add(f"-100{s.lstrip('-')}", canonical)
-            except Exception:
-                pass
+        elif re.fullmatch(r"[A-Za-z0-9_]{4,}", canonical):
+            # Looks like a Telegram username (very loose check). This prevents
+            # common misconfig where BACKLOG_TARGETS uses 'name' but the folder
+            # on disk (or logs) use '@name'.
+            _add(f"@{canonical}", canonical)
+
+        # Numeric-ish aliases
+        try:
+            n = int(canonical)
+            s = str(n)
+            _add(s, canonical)
+            if s.startswith("-100"):
+                _add(s.replace("-100", "", 1), canonical)
+            else:
+                _add(f"-100{s.lstrip('-')}", canonical)
+        except Exception:
+            pass
 
     return alias_to_canonical
 
@@ -614,8 +623,15 @@ async def resolve_peer_id(app: Client, store: BacklogStore, target_key: str, all
     if isinstance(cached, int) and cached != 0:
         return cached
 
-    # Try resolve from allowlist token first
-    try_tokens = [allowlist_token]
+    # Try resolve from allowlist token first (and tolerate @/non-@ variants)
+    try_tokens: List[str] = [allowlist_token]
+
+    # If username-ish, try both '@name' and 'name'
+    if isinstance(allowlist_token, str) and allowlist_token:
+        if allowlist_token.startswith("@"):
+            try_tokens.append(allowlist_token[1:])
+        elif re.fullmatch(r"[A-Za-z0-9_]{4,}", allowlist_token):
+            try_tokens.append(f"@{allowlist_token}")
 
     # If numeric without -100, also try with -100 prefix (channels/supergroups)
     if not allowlist_token.startswith("@"):
@@ -627,6 +643,10 @@ async def resolve_peer_id(app: Client, store: BacklogStore, target_key: str, all
             pass
 
     last_exc: Optional[Exception] = None
+    # De-dup while preserving order
+    seen: set[str] = set()
+    try_tokens = [t for t in try_tokens if not (t in seen or seen.add(t))]
+
     for tok in try_tokens:
         try:
             chat = await app.get_chat(_target_token_for_pyrogram(tok))
