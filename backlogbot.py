@@ -19,7 +19,7 @@ from pymongo import ReturnDocument
 load_dotenv()
 
 logger = logging.getLogger("backlogbot")
-
+ 
 
 def configure_logging() -> None:
     """Configure logging for backlogbot.
@@ -70,6 +70,7 @@ def configure_logging() -> None:
     ]
     for name in noisy:
         logging.getLogger(name).setLevel(lib_level)
+
 
 
 def _log_env_snapshot() -> None:
@@ -470,8 +471,6 @@ class BacklogStore:
             },
         )
         return await self.items.find_one({"_id": item_id})
-
-
 def _ensure_aware_utc(dt: Any) -> Optional[datetime]:
     """Best-effort normalize datetime to timezone-aware UTC."""
     if dt is None:
@@ -500,7 +499,6 @@ def _roll_forward(dt: datetime, *, min_dt: datetime, step_seconds: int) -> datet
     if dt + timedelta(seconds=steps * step_seconds) < min_dt:
         steps += 1
     return dt + timedelta(seconds=steps * step_seconds)
-
 
 def build_allowlist_alias_map(allowlist: List[str]) -> Dict[str, str]:
     """Return mapping of alias->canonical allowlist token.
@@ -609,8 +607,6 @@ def is_transient_sync_file(path: Path) -> bool:
     if name.startswith(".syncthing."):
         return True
     return False
-
-
 async def quarantine_paths(cfg: BacklogConfig, *, reason: str, target_bucket: str, paths: List[Path]) -> None:
     # Move each path under archive/_quarantine/<reason>/<target_bucket>/
     base = cfg.archive_root / "_quarantine" / reason / target_bucket
@@ -730,7 +726,6 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore) -> None:
             if is_transient_sync_file(p):
                 logger.debug("scan_backlog: ignoring transient sync file: %s", p)
                 continue
-
             # Ignore sidecars themselves; we only enqueue the media.
             if p.name.endswith(".caption.txt"):
                 continue
@@ -890,7 +885,6 @@ async def should_post_now(cfg: BacklogConfig, target_doc: Dict[str, Any]) -> boo
         return True
     if last_dt.tzinfo is None:
         last_dt = last_dt.replace(tzinfo=timezone.utc)
-
     due_at = last_dt + timedelta(seconds=cfg.interval_seconds)
     if now_utc() >= due_at:
         return True
