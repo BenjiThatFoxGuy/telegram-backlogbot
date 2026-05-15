@@ -19,7 +19,57 @@ from pymongo import ReturnDocument
 load_dotenv()
 
 logger = logging.getLogger("backlogbot")
-logging.basicConfig(level=logging.INFO)
+
+
+def configure_logging() -> None:
+    """Configure logging for backlogbot.
+
+    Goal: keep our own logic logs visible while reducing noisy MTProto/client logs
+    from Pyrogram and other dependencies.
+
+    Env vars:
+      - BACKLOG_LOG_LEVEL: backlogbot logger level (default: INFO)
+      - BACKLOG_LIB_LOG_LEVEL: 3rd-party library logger level (default: WARNING)
+    """
+
+    def _level_from_env(name: str, default: int) -> int:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        raw = raw.strip().upper()
+        return getattr(logging, raw, default)
+
+    bot_level = _level_from_env("BACKLOG_LOG_LEVEL", logging.INFO)
+    lib_level = _level_from_env("BACKLOG_LIB_LOG_LEVEL", logging.WARNING)
+
+    # Default root to library level so we don't get spam from dependencies.
+    # We'll explicitly set backlogbot's logger to bot_level.
+    logging.basicConfig(
+        level=lib_level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    # Our logger: keep at requested level.
+    logger.setLevel(bot_level)
+
+    # Known noisy loggers (MTProto / network chatter / DB driver diagnostics)
+    noisy = [
+        "pyrogram",
+        "pyrogram.raw",
+        "pyrogram.connection",
+        "pyrogram.session",
+        "pyrogram.dispatcher",
+        "pyrogram.handlers",
+        "pyrogram.parser",
+        "pymongo",
+        "asyncio",
+        # Not used directly here, but some deployments share config across bots.
+        "telethon",
+        "telethon.network",
+        "telethon.client",
+    ]
+    for name in noisy:
+        logging.getLogger(name).setLevel(lib_level)
 
 
 def _log_env_snapshot() -> None:
@@ -997,11 +1047,7 @@ async def telegram_scheduler_loop(cfg: BacklogConfig, store: BacklogStore, app: 
 
 
 async def main() -> None:
-    # Allow turning up verbosity without changing code
-    # (e.g. BACKLOG_LOG_LEVEL=DEBUG)
-    log_level = os.getenv("BACKLOG_LOG_LEVEL", "INFO").strip().upper()
-    logging.getLogger().setLevel(getattr(logging, log_level, logging.INFO))
-    logger.setLevel(getattr(logging, log_level, logging.INFO))
+    configure_logging()
 
     _log_env_snapshot()
 
