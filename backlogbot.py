@@ -557,6 +557,19 @@ def pick_send_kind(path: Path, allow_unknown_as_document: bool) -> Optional[str]
     return None
 
 
+def is_transient_sync_file(path: Path) -> bool:
+    """Return True for known temporary/in-progress sync files.
+
+    Syncthing creates files like `.syncthing.<random>` while transferring.
+    These are not user content and should never be quarantined/archived.
+    """
+    name = path.name
+    # Syncthing temp file naming convention
+    if name.startswith(".syncthing."):
+        return True
+    return False
+
+
 async def quarantine_paths(cfg: BacklogConfig, *, reason: str, target_bucket: str, paths: List[Path]) -> None:
     # Move each path under archive/_quarantine/<reason>/<target_bucket>/
     base = cfg.archive_root / "_quarantine" / reason / target_bucket
@@ -670,6 +683,11 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore) -> None:
 
         for p in folder_files:
             if not p.is_file():
+                continue
+
+            # Ignore transient sync/in-progress temp files (e.g. Syncthing)
+            if is_transient_sync_file(p):
+                logger.debug("scan_backlog: ignoring transient sync file: %s", p)
                 continue
 
             # Ignore sidecars themselves; we only enqueue the media.
