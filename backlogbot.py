@@ -1012,34 +1012,34 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore, app: Optional[Cl
                         target_bucket=target_key,
                         paths=to_quarantine,
                     )
-                continue
+                    continue
 
-            try:
-                st = p.stat()
-                # Reuse the earlier hash if we already computed it for dedupe.
-                sha = sha_for_dedup or compute_sha256(p)
-                rel_path = rel_path_from_any_root(cfg, p)
-                inserted = await store.upsert_item_discovered(
-                    target_key=target_key,
-                    rel_path=rel_path,
-                    sha256=sha,
-                    size=int(st.st_size),
-                    mtime=float(st.st_mtime),
-                    send_kind=send_kind,
-                )
-                if inserted:
-                    logger.info(
-                        "scan_backlog: enqueued target=%s rel=%s kind=%s size=%d sha=%s",
-                        target_key,
-                        rel_path,
-                        send_kind,
-                        int(st.st_size),
-                        sha[:12],
+                try:
+                    st = p.stat()
+                    # Reuse the earlier hash if we already computed it for dedupe.
+                    sha = sha_for_dedup or compute_sha256(p)
+                    rel_path = rel_path_from_any_root(cfg, p)
+                    inserted = await store.upsert_item_discovered(
+                        target_key=target_key,
+                        rel_path=rel_path,
+                        sha256=sha,
+                        size=int(st.st_size),
+                        mtime=float(st.st_mtime),
+                        send_kind=send_kind,
                     )
-                else:
-                    logger.debug("scan_backlog: already enqueued (skip) target=%s rel=%s", target_key, rel_path)
-            except Exception as e:
-                logger.exception("Failed to enqueue %s: %s", p, e)
+                    if inserted:
+                        logger.info(
+                            "scan_backlog: enqueued target=%s rel=%s kind=%s size=%d sha=%s",
+                            target_key,
+                            rel_path,
+                            send_kind,
+                            int(st.st_size),
+                            sha[:12],
+                        )
+                    else:
+                        logger.debug("scan_backlog: already enqueued (skip) target=%s rel=%s", target_key, rel_path)
+                except Exception as e:
+                    logger.exception("Failed to enqueue %s: %s", p, e)
 
 
 async def send_one_item(
