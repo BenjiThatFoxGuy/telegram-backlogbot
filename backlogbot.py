@@ -172,6 +172,9 @@ class BacklogConfig:
     backlog_state_db: str
 
 
+MISSING_FILE_MAX_RETRIES = 10
+
+
 def load_config() -> BacklogConfig:
     backlog_root = Path(_env_str("BACKLOG_ROOT", "/backlog"))
 
@@ -776,6 +779,26 @@ async def handle_success(cfg: BacklogConfig, *, target_key: str, media: Path, si
         return
 
 
+def rel_path_from_any_root(cfg: BacklogConfig, path: Path) -> str:
+    """Return a rel_path for a file under any configured backlog root."""
+    for root in cfg.backlog_roots:
+        try:
+            return str(path.relative_to(root))
+        except ValueError:
+            continue
+    # Backwards-compatible fallback for older single-root assumptions.
+    return str(path.relative_to(cfg.backlog_root))
+
+
+def resolve_media_path(cfg: BacklogConfig, rel_path: str) -> Path:
+    """Resolve a stored rel_path to the first matching file across backlog roots."""
+    for root in cfg.backlog_roots:
+        candidate = root / rel_path
+        if candidate.exists():
+            return candidate
+    return cfg.backlog_root / rel_path
+
+
 async def scan_backlog(cfg: BacklogConfig, store: BacklogStore, app: Optional[Client] = None) -> None:
     """Scan backlog roots, discover stable media files, and enqueue them in DB.
 
@@ -954,7 +977,7 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore, app: Optional[Cl
                     logger.info(
                         "scan_backlog: duplicate content; quarantining target=%s rel=%s sha=%s existing_status=%s existing_rel=%s",
                         target_key,
-                        str(p.relative_to(cfg.backlog_root)),
+                        rel_path_from_any_root(cfg, p),
                         (sha_for_dedup or "")[:12],
                         existing.get("status"),
                         existing.get("rel_path"),
@@ -973,7 +996,7 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore, app: Optional[Cl
                         "scan_backlog: duplicate content but existing_status=%s (not quarantining) target=%s rel=%s sha=%s existing_rel=%s",
                         existing.get("status"),
                         target_key,
-                        str(p.relative_to(cfg.backlog_root)),
+                        rel_path_from_any_root(cfg, p),
                         (sha_for_dedup or "")[:12],
                         existing.get("rel_path"),
                     )
@@ -995,7 +1018,7 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore, app: Optional[Cl
                 st = p.stat()
                 # Reuse the earlier hash if we already computed it for dedupe.
                 sha = sha_for_dedup or compute_sha256(p)
-                rel_path = str(p.relative_to(cfg.backlog_root))
+                rel_path = rel_path_from_any_root(cfg, p)
                 inserted = await store.upsert_item_discovered(
                     target_key=target_key,
                     rel_path=rel_path,
@@ -1030,7 +1053,7 @@ async def send_one_item(
 ) -> Tuple[bool, Optional[int], Optional[str]]:
     """Send or schedule one item. Returns (success, message_id, error)."""
     rel_path = item["rel_path"]
-    media_path = cfg.backlog_root / rel_path
+    media_path = resolve_media_path(cfg, rel_path)
     target_key = item["target_key"]
 
     if not media_path.exists():
@@ -1208,10 +1231,11 @@ async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client)
                     err,
                 )
                 updated = await store.bump_failure(item["_id"], err or "unknown", retry_after_seconds=cfg.scan_every_seconds)
-                if updated and int(updated.get("fail_count", 0)) >= cfg.max_failures:
+                failure_limit = MISSING_FILE_MAX_RETRIES if err and err.startswith("missing file:") else cfg.max_failures
+                if updated and int(updated.get("fail_count", 0)) >= failure_limit:
                     # move file to failed archive bucket
                     rel = updated["rel_path"]
-                    media = cfg.backlog_root / rel
+                    media = resolve_media_path(cfg, rel)
                     sidecar = caption_sidecar_for(media)
                     paths = [media] + ([sidecar] if sidecar.exists() else [])
                     await archive_paths(cfg, bucket="_failed", target_key=target_key, paths=paths)
@@ -1260,9 +1284,10 @@ async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client)
                                 err or "unknown",
                                 retry_after_seconds=cfg.scan_every_seconds,
                             )
-                            if updated and int(updated.get("fail_count", 0)) >= cfg.max_failures:
+                            failure_limit = MISSING_FILE_MAX_RETRIES if err and err.startswith("missing file:") else cfg.max_failures
+                            if updated and int(updated.get("fail_count", 0)) >= failure_limit:
                                 rel = updated["rel_path"]
-                                media = cfg.backlog_root / rel
+                                media = resolve_media_path(cfg, rel)
                                 sidecar = caption_sidecar_for(media)
                                 paths = [media] + ([sidecar] if sidecar.exists() else [])
                                 await archive_paths(cfg, bucket="_failed", target_key=target_key, paths=paths)
@@ -1309,9 +1334,10 @@ async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client)
                     err,
                 )
                 updated = await store.bump_failure(item["_id"], err or "unknown", retry_after_seconds=cfg.scan_every_seconds)
-                if updated and int(updated.get("fail_count", 0)) >= cfg.max_failures:
+                failure_limit = MISSING_FILE_MAX_RETRIES if err and err.startswith("missing file:") else cfg.max_failures
+                if updated and int(updated.get("fail_count", 0)) >= failure_limit:
                     rel = updated["rel_path"]
-                    media = cfg.backlog_root / rel
+                    media = resolve_media_path(cfg, rel)
                     sidecar = caption_sidecar_for(media)
                     paths = [media] + ([sidecar] if sidecar.exists() else [])
                     await archive_paths(cfg, bucket="_failed", target_key=target_key, paths=paths)
