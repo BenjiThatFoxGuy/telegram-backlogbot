@@ -938,57 +938,57 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore, app: Optional[Cl
                     logger.debug("scan_backlog: file not settled yet: %s", p)
                     continue
 
-            # De-dup by content hash per target.
-            # IMPORTANT: only quarantine when we know the content was already POSTED.
-            # If the existing item is merely pending/scheduled, it's not a true duplicate
-            # yet (it might never get posted), so we leave this file alone.
-            try:
-                sha_for_dedup = compute_sha256(p)
-                existing = await store.find_existing_content_item(target_key=target_key, sha256=sha_for_dedup)
-            except Exception as e:
-                logger.warning("scan_backlog: failed duplicate check for %s: %s", p, e)
-                existing = None
-                sha_for_dedup = None
+                # De-dup by content hash per target.
+                # IMPORTANT: only quarantine when we know the content was already POSTED.
+                # If the existing item is merely pending/scheduled, it's not a true duplicate
+                # yet (it might never get posted), so we leave this file alone.
+                try:
+                    sha_for_dedup = compute_sha256(p)
+                    existing = await store.find_existing_content_item(target_key=target_key, sha256=sha_for_dedup)
+                except Exception as e:
+                    logger.warning("scan_backlog: failed duplicate check for %s: %s", p, e)
+                    existing = None
+                    sha_for_dedup = None
 
-            if existing and existing.get("status") == "posted":
-                logger.info(
-                    "scan_backlog: duplicate content; quarantining target=%s rel=%s sha=%s existing_status=%s existing_rel=%s",
-                    target_key,
-                    str(p.relative_to(cfg.backlog_root)),
-                    (sha_for_dedup or "")[:12],
-                    existing.get("status"),
-                    existing.get("rel_path"),
-                )
-                sidecar = caption_sidecar_for(p)
-                to_quarantine = [p] + ([sidecar] if sidecar.exists() else [])
-                await quarantine_paths(
-                    cfg,
-                    reason="duplicate",
-                    target_bucket=target_key,
-                    paths=to_quarantine,
-                )
-                continue
-            elif existing:
-                logger.debug(
-                    "scan_backlog: duplicate content but existing_status=%s (not quarantining) target=%s rel=%s sha=%s existing_rel=%s",
-                    existing.get("status"),
-                    target_key,
-                    str(p.relative_to(cfg.backlog_root)),
-                    (sha_for_dedup or "")[:12],
-                    existing.get("rel_path"),
-                )
+                if existing and existing.get("status") == "posted":
+                    logger.info(
+                        "scan_backlog: duplicate content; quarantining target=%s rel=%s sha=%s existing_status=%s existing_rel=%s",
+                        target_key,
+                        str(p.relative_to(cfg.backlog_root)),
+                        (sha_for_dedup or "")[:12],
+                        existing.get("status"),
+                        existing.get("rel_path"),
+                    )
+                    sidecar = caption_sidecar_for(p)
+                    to_quarantine = [p] + ([sidecar] if sidecar.exists() else [])
+                    await quarantine_paths(
+                        cfg,
+                        reason="duplicate",
+                        target_bucket=target_key,
+                        paths=to_quarantine,
+                    )
+                    continue
+                elif existing:
+                    logger.debug(
+                        "scan_backlog: duplicate content but existing_status=%s (not quarantining) target=%s rel=%s sha=%s existing_rel=%s",
+                        existing.get("status"),
+                        target_key,
+                        str(p.relative_to(cfg.backlog_root)),
+                        (sha_for_dedup or "")[:12],
+                        existing.get("rel_path"),
+                    )
 
-            send_kind = pick_send_kind(p, cfg.allow_unknown_as_document)
-            if send_kind is None:
-                logger.info("scan_backlog: disallowed filetype; quarantining: %s", p)
-                sidecar = caption_sidecar_for(p)
-                to_quarantine = [p] + ([sidecar] if sidecar.exists() else [])
-                await quarantine_paths(
-                    cfg,
-                    reason="disallowed_unknown",
-                    target_bucket=target_key,
-                    paths=to_quarantine,
-                )
+                send_kind = pick_send_kind(p, cfg.allow_unknown_as_document)
+                if send_kind is None:
+                    logger.info("scan_backlog: disallowed filetype; quarantining: %s", p)
+                    sidecar = caption_sidecar_for(p)
+                    to_quarantine = [p] + ([sidecar] if sidecar.exists() else [])
+                    await quarantine_paths(
+                        cfg,
+                        reason="disallowed_unknown",
+                        target_bucket=target_key,
+                        paths=to_quarantine,
+                    )
                 continue
 
             try:
