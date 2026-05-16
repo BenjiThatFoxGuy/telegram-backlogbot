@@ -1439,10 +1439,10 @@ async def telegram_scheduler_loop(cfg: BacklogConfig, store: BacklogStore, app: 
                 candidate = (last_sched_dt + timedelta(seconds=cfg.interval_seconds)) if last_sched_dt else None
                 next_time = max(min_next, _ceil_to_minute(candidate)) if candidate else min_next
 
-            # Schedule items until horizon.
-            # To avoid scheduling a large offline backlog all at once right after startup,
-            # we intentionally schedule at most ONE item per target per loop.
-            scheduled_this_tick = 0
+            # Schedule items until horizon. This is the point of scheduler mode: fill
+            # Telegram's scheduled-message queue with one backlog item per interval.
+            # If we only schedule one item here, a restart/redeploy can leave just the
+            # first post queued and make the configured interval appear broken.
             while next_time <= horizon:
                 item = await store.get_next_due_item(target_key=target_key)
                 if not item:
@@ -1458,6 +1458,13 @@ async def telegram_scheduler_loop(cfg: BacklogConfig, store: BacklogStore, app: 
                 )
 
                 if ok:
+                    logger.info(
+                        "scheduler: scheduled target=%s rel=%s at=%s msg_id=%s",
+                        target_key,
+                        item.get("rel_path"),
+                        next_time,
+                        msg_id,
+                    )
                     await store.set_item_status(
                         item["_id"],
                         "scheduled",
@@ -1480,14 +1487,18 @@ async def telegram_scheduler_loop(cfg: BacklogConfig, store: BacklogStore, app: 
                     )
                     # increment next schedule slot
                     next_time = _ceil_to_minute(next_time + timedelta(seconds=cfg.interval_seconds))
-                    scheduled_this_tick += 1
-                    if scheduled_this_tick >= 1:
-                        break
                 else:
+                    logger.warning(
+                        "scheduler: schedule failed target=%s rel=%s at=%s err=%s",
+                        target_key,
+                        item.get("rel_path"),
+                        next_time,
+                        err,
+                    )
                     updated = await store.bump_failure(item["_id"], err or "unknown", retry_after_seconds=cfg.scan_every_seconds)
                     if updated and int(updated.get("fail_count", 0)) >= cfg.max_failures:
                         rel = updated["rel_path"]
-                        media = cfg.backlog_root / rel
+                        media = resolve_media_path(cfg, rel)
                         sidecar = caption_sidecar_for(media)
                         paths = [media] + ([sidecar] if sidecar.exists() else [])
                         await archive_paths(cfg, bucket="_failed", target_key=target_key, paths=paths)
