@@ -705,6 +705,21 @@ def is_transient_sync_file(path: Path) -> bool:
     if name.startswith(".syncthing."):
         return True
     return False
+
+
+def is_ignorable_metadata_file(path: Path) -> bool:
+    """Return True for OS/tool metadata files we should silently ignore.
+
+    These are not user content. We should not quarantine, archive, or enqueue them.
+    """
+    name = path.name
+    # macOS Finder metadata
+    if name == ".DS_Store" or name.startswith("._"):
+        return True
+    # Windows Explorer thumbnail cache
+    if name.lower() == "thumbs.db":
+        return True
+    return False
 async def quarantine_paths(cfg: BacklogConfig, *, reason: str, target_bucket: str, paths: List[Path]) -> None:
     # Move each path under archive/_quarantine/<reason>/<target_bucket>/
     base = cfg.archive_root / "_quarantine" / reason / target_bucket
@@ -805,7 +820,7 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore, app: Optional[Cl
             else:
                 logger.info("scan_backlog: folder %s not target-like; quarantining files (if any)", folder_name)
                 # Not a target-like folder; quarantine its contents.
-                files = [p for p in child.iterdir() if p.is_file()]
+                files = [p for p in child.iterdir() if p.is_file() and not is_ignorable_metadata_file(p)]
                 if files:
                     await quarantine_paths(cfg, reason="unmapped_target", target_bucket=folder_name, paths=files)
             continue
@@ -842,7 +857,7 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore, app: Optional[Cl
                     folder_name,
                 )
                 # Folder exists but not allowlisted/mappable: quarantine contents.
-                files = [p for p in child.iterdir() if p.is_file()]
+                files = [p for p in child.iterdir() if p.is_file() and not is_ignorable_metadata_file(p)]
                 if files:
                     await quarantine_paths(cfg, reason="unmapped_target", target_bucket=folder_name, paths=files)
             continue
@@ -865,6 +880,11 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore, app: Optional[Cl
 
         for p in folder_files:
             if not p.is_file():
+                continue
+
+            # Ignore OS/tool metadata files entirely
+            if is_ignorable_metadata_file(p):
+                logger.debug("scan_backlog: ignoring metadata file: %s", p)
                 continue
 
             # Ignore transient sync/in-progress temp files (e.g. Syncthing)
