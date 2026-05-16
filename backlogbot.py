@@ -136,6 +136,7 @@ def parse_duration_to_seconds(value: str) -> int:
 class BacklogConfig:
     enabled: bool
     backlog_root: Path
+    backlog_roots: List[Path]
     archive_root: Path
 
     targets_allowlist: List[str]
@@ -173,6 +174,20 @@ class BacklogConfig:
 
 def load_config() -> BacklogConfig:
     backlog_root = Path(_env_str("BACKLOG_ROOT", "/backlog"))
+
+    # Support multiple input roots via BACKLOG_ROOT_1, BACKLOG_ROOT_2, ...
+    # If none are provided, fall back to BACKLOG_ROOT.
+    numbered_roots: List[Path] = []
+    for i in range(1, 51):
+        v = os.getenv(f"BACKLOG_ROOT_{i}")
+        if v is None:
+            continue
+        v = v.strip()
+        if not v:
+            continue
+        numbered_roots.append(Path(v))
+
+    backlog_roots = numbered_roots or [backlog_root]
     archive_root = Path(_env_str("BACKLOG_ARCHIVE_ROOT", "/backlog_archive"))
 
     allowlist_raw = _env_str("BACKLOG_TARGETS", "").strip()
@@ -185,6 +200,7 @@ def load_config() -> BacklogConfig:
     cfg = BacklogConfig(
         enabled=_env_bool("BACKLOG_ENABLE", True),
         backlog_root=backlog_root,
+        backlog_roots=backlog_roots,
         archive_root=archive_root,
         targets_allowlist=targets_allowlist,
         scan_every_seconds=_env_int("BACKLOG_SCAN_EVERY_SECONDS", 30),
@@ -228,11 +244,12 @@ def load_config() -> BacklogConfig:
         raise ValueError("BACKLOG_SCHEDULER_MODE must be 'fixed_cadence' or 'legacy'")
 
     logger.info(
-        "Config: enabled=%s root=%s archive=%s allowlist=%s scan_every=%ss settle=%ss interval=%ss scope=%s overdue=%s "
+        "Config: enabled=%s root=%s roots=%s archive=%s allowlist=%s scan_every=%ss settle=%ss interval=%ss scope=%s overdue=%s "
         "success_action=%s allow_unknown_as_document=%s skip_quarantine_unmapped_targets=%s "
         "immediate_post_on_start=%s scheduler=%s scheduler_mode=%s schedule_ahead=%ss min_schedule_delay=%ss max_failures=%s state_db=%s tz=%s",
         cfg.enabled,
         cfg.backlog_root,
+        cfg.backlog_roots,
         cfg.archive_root,
         cfg.targets_allowlist,
         cfg.scan_every_seconds,
@@ -760,14 +777,15 @@ async def handle_success(cfg: BacklogConfig, *, target_key: str, media: Path, si
 
 
 async def scan_backlog(cfg: BacklogConfig, store: BacklogStore, app: Optional[Client] = None) -> None:
-    """Scan BACKLOG_ROOT, discover stable media files, and enqueue them in DB.
+    """Scan backlog roots, discover stable media files, and enqueue them in DB.
 
     If `app` is provided, we can be "smarter" about mapping folder names to the
     configured allowlist by resolving Telegram peers (e.g. allowlist contains a
     numeric chat id but the folder on disk is an @username).
     """
     logger.debug("scan_backlog: starting scan")
-    ensure_dir(cfg.backlog_root)
+    for r in cfg.backlog_roots:
+        ensure_dir(r)
     allowlist = parse_allowlist(cfg.targets_allowlist)
 
     alias_map = build_allowlist_alias_map(allowlist)
@@ -775,129 +793,150 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore, app: Optional[Cl
     resolved_folder_to_canonical: Dict[str, str] = {}
 
     logger.info(
-        "scan_backlog: root=%s allowlist_count=%d allowlist=%s",
-        cfg.backlog_root,
+        "scan_backlog: roots=%s allowlist_count=%d allowlist=%s",
+        cfg.backlog_roots,
         len(allowlist),
         allowlist,
     )
 
-    try:
-        children = list(cfg.backlog_root.iterdir())
-    except Exception:
-        logger.exception("scan_backlog: failed to list backlog root %s", cfg.backlog_root)
-        return
-
-    logger.info("scan_backlog: found %d entries under root", len(children))
-
-    for child in children:
-        if not child.is_dir():
-            logger.debug("scan_backlog: skipping non-dir %s", child)
-            continue
-
-        folder_name = child.name
-
-        # We only scan folders that can map to allowlist somehow.
-        # Mapping strategy:
-        #   - Fast path: alias_map (format variants like @name<->name, -100id<->id)
-        #   - Smart path (if app provided): resolve folder peer_id and match it to
-        #     one of the allowlisted tokens by peer_id.
-        #
-        # Folder names we consider "target-like":
-        #   - @username
-        #   - numeric (chat id)
-        #   - bare username-ish (so folders named 'MyChannel' work too)
-        looks_like_target = (
-            folder_name.startswith("@")
-            or re.fullmatch(r"-?\d+", folder_name) is not None
-            or re.fullmatch(r"[A-Za-z0-9_]{4,}", folder_name) is not None
-        )
-        if not looks_like_target:
-            if cfg.skip_quarantine_unmapped_targets:
-                logger.info(
-                    "scan_backlog: folder %s not target-like; skipping quarantine (config)",
-                    folder_name,
-                )
-            else:
-                logger.info("scan_backlog: folder %s not target-like; quarantining files (if any)", folder_name)
-                # Not a target-like folder; quarantine its contents.
-                files = [p for p in child.iterdir() if p.is_file() and not is_ignorable_metadata_file(p)]
-                if files:
-                    await quarantine_paths(cfg, reason="unmapped_target", target_bucket=folder_name, paths=files)
-            continue
-
-        canonical_target = resolved_folder_to_canonical.get(folder_name) or alias_map.get(folder_name)
-        if canonical_target is None and app is not None:
-            # "Smart" mapping: allow allowlist entries like -100123... while
-            # accepting folders like @MyChannel (or MyChannel) by resolving peer_id.
-            try:
-                folder_peer_id = await resolve_peer_id(app, store, target_key=folder_name, allowlist_token=folder_name)
-            except Exception:
-                folder_peer_id = None
-
-            if isinstance(folder_peer_id, int):
-                for allow_tok in allowlist:
-                    try:
-                        allow_peer_id = await resolve_peer_id(app, store, target_key=allow_tok, allowlist_token=allow_tok)
-                    except Exception:
-                        continue
-                    if allow_peer_id == folder_peer_id:
-                        canonical_target = allow_tok
-                        # Cache for the rest of this scan cycle.
-                        resolved_folder_to_canonical[folder_name] = canonical_target
-                        break
-        if canonical_target is None:
-            if cfg.skip_quarantine_unmapped_targets:
-                logger.info(
-                    "scan_backlog: folder %s not allowlisted/mappable; skipping quarantine (config)",
-                    folder_name,
-                )
-            else:
-                logger.info(
-                    "scan_backlog: folder %s not allowlisted/mappable; quarantining files (if any)",
-                    folder_name,
-                )
-                # Folder exists but not allowlisted/mappable: quarantine contents.
-                files = [p for p in child.iterdir() if p.is_file() and not is_ignorable_metadata_file(p)]
-                if files:
-                    await quarantine_paths(cfg, reason="unmapped_target", target_bucket=folder_name, paths=files)
-            continue
-
-        target_key = canonical_target
-        await store.get_or_create_target(target_key)
-
+    for root in cfg.backlog_roots:
         try:
-            folder_files = list(child.iterdir())
+            children = list(root.iterdir())
         except Exception:
-            logger.exception("scan_backlog: failed to list folder %s", child)
+            logger.exception("scan_backlog: failed to list backlog root %s", root)
             continue
 
-        logger.info(
-            "scan_backlog: scanning target folder=%s (canonical=%s) entries=%d",
-            child,
-            target_key,
-            len(folder_files),
-        )
+        logger.info("scan_backlog: root=%s found %d entries under root", root, len(children))
 
-        for p in folder_files:
-            if not p.is_file():
+        for child in children:
+            if not child.is_dir():
+                logger.debug("scan_backlog: skipping non-dir %s", child)
                 continue
 
-            # Ignore OS/tool metadata files entirely
-            if is_ignorable_metadata_file(p):
-                logger.debug("scan_backlog: ignoring metadata file: %s", p)
+            folder_name = child.name
+
+            # We only scan folders that can map to allowlist somehow.
+            # Mapping strategy:
+            #   - Fast path: alias_map (format variants like @name<->name, -100id<->id)
+            #   - Smart path (if app provided): resolve folder peer_id and match it to
+            #     one of the allowlisted tokens by peer_id.
+            #
+            # Folder names we consider "target-like":
+            #   - @username
+            #   - numeric (chat id)
+            #   - bare username-ish (so folders named 'MyChannel' work too)
+            looks_like_target = (
+                folder_name.startswith("@")
+                or re.fullmatch(r"-?\d+", folder_name) is not None
+                or re.fullmatch(r"[A-Za-z0-9_]{4,}", folder_name) is not None
+            )
+
+            if not looks_like_target:
+                if cfg.skip_quarantine_unmapped_targets:
+                    logger.info(
+                        "scan_backlog: root=%s folder=%s not target-like; skipping quarantine (config)",
+                        root,
+                        folder_name,
+                    )
+                else:
+                    logger.info(
+                        "scan_backlog: root=%s folder=%s not target-like; quarantining files (if any)",
+                        root,
+                        folder_name,
+                    )
+                    # Not a target-like folder; quarantine its contents.
+                    files = [p for p in child.iterdir() if p.is_file() and not is_ignorable_metadata_file(p)]
+                    if files:
+                        await quarantine_paths(cfg, reason="unmapped_target", target_bucket=folder_name, paths=files)
                 continue
 
-            # Ignore transient sync/in-progress temp files (e.g. Syncthing)
-            if is_transient_sync_file(p):
-                logger.debug("scan_backlog: ignoring transient sync file: %s", p)
-                continue
-            # Ignore sidecars themselves; we only enqueue the media.
-            if p.name.endswith(".caption.txt"):
+            canonical_target = resolved_folder_to_canonical.get(folder_name) or alias_map.get(folder_name)
+            if canonical_target is None and app is not None:
+                # "Smart" mapping: allow allowlist entries like -100123... while
+                # accepting folders like @MyChannel (or MyChannel) by resolving peer_id.
+                try:
+                    folder_peer_id = await resolve_peer_id(
+                        app,
+                        store,
+                        target_key=folder_name,
+                        allowlist_token=folder_name,
+                    )
+                except Exception:
+                    folder_peer_id = None
+
+                if isinstance(folder_peer_id, int):
+                    for allow_tok in allowlist:
+                        try:
+                            allow_peer_id = await resolve_peer_id(
+                                app,
+                                store,
+                                target_key=allow_tok,
+                                allowlist_token=allow_tok,
+                            )
+                        except Exception:
+                            continue
+                        if allow_peer_id == folder_peer_id:
+                            canonical_target = allow_tok
+                            # Cache for the rest of this scan cycle.
+                            resolved_folder_to_canonical[folder_name] = canonical_target
+                            break
+            if canonical_target is None:
+                if cfg.skip_quarantine_unmapped_targets:
+                    logger.info(
+                        "scan_backlog: root=%s folder=%s not allowlisted/mappable; skipping quarantine (config)",
+                        root,
+                        folder_name,
+                    )
+                else:
+                    logger.info(
+                        "scan_backlog: root=%s folder=%s not allowlisted/mappable; quarantining files (if any)",
+                        root,
+                        folder_name,
+                    )
+                    # Folder exists but not allowlisted/mappable: quarantine contents.
+                    files = [p for p in child.iterdir() if p.is_file() and not is_ignorable_metadata_file(p)]
+                    if files:
+                        await quarantine_paths(cfg, reason="unmapped_target", target_bucket=folder_name, paths=files)
                 continue
 
-            if not is_stable_file(p, cfg.settle_seconds):
-                logger.debug("scan_backlog: file not settled yet: %s", p)
+            target_key = canonical_target
+            await store.get_or_create_target(target_key)
+
+            try:
+                folder_files = list(child.iterdir())
+            except Exception:
+                logger.exception("scan_backlog: failed to list folder %s", child)
                 continue
+
+            logger.info(
+                "scan_backlog: root=%s scanning target folder=%s (canonical=%s) entries=%d",
+                root,
+                child,
+                target_key,
+                len(folder_files),
+            )
+
+            for p in folder_files:
+                if not p.is_file():
+                    continue
+
+                # Ignore OS/tool metadata files entirely
+                if is_ignorable_metadata_file(p):
+                    logger.debug("scan_backlog: ignoring metadata file: %s", p)
+                    continue
+
+                # Ignore transient sync/in-progress temp files (e.g. Syncthing)
+                if is_transient_sync_file(p):
+                    logger.debug("scan_backlog: ignoring transient sync file: %s", p)
+                    continue
+
+                # Ignore sidecars themselves; we only enqueue the media.
+                if p.name.endswith(".caption.txt"):
+                    continue
+
+                if not is_stable_file(p, cfg.settle_seconds):
+                    logger.debug("scan_backlog: file not settled yet: %s", p)
+                    continue
 
             # De-dup by content hash per target.
             # IMPORTANT: only quarantine when we know the content was already POSTED.
