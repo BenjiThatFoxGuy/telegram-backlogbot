@@ -6,8 +6,8 @@ WORKDIR /userbot
 
 # System deps likely needed by some Python wheels / media handling.
 # (Keep small; add more only when needed.)
-RUN --mount=type=cache,target=/var/cache/apt \
-    --mount=type=cache,target=/var/lib/apt \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update ; \
     apt-get install -y --no-install-recommends \
     ffmpeg \
