@@ -1067,15 +1067,15 @@ async def send_one_item(
         except Exception:
             caption = None
 
-    # Always add marker in scheduler mode, even if no caption sidecar exists.
+    # In scheduler mode, append marker to caption if caption exists (for dedup/reconciliation).
+    # Do not add a caption if the user did not provide one.
     if cfg.use_telegram_scheduler:
         # Note: stickers cannot carry captions; for those we rely on message_id reconciliation.
         if item.get("send_kind") != "sticker":
             marker = sha_marker(item["sha256"])
             if caption:
                 caption = caption + marker
-            else:
-                caption = marker.strip()  # marker-only caption
+            # else: leave caption as None
 
     send_kind = item["send_kind"]
 
@@ -1207,6 +1207,12 @@ async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client)
                     )
                 else:
                     logger.debug("direct_post_loop: should_post_now=false for target=%s", target_key)
+                    # Defer pending items for this target until they're actually due to avoid starvation
+                    due_at = next_post_due_at(cfg, target_doc)
+                    try:
+                        await store.defer_pending_items_until(target_key=target_key, when=due_at)
+                    except Exception:
+                        logger.exception("direct_post_loop: failed deferring pending items for target=%s", target_key)
                     await asyncio.sleep(5)
                     continue
 
