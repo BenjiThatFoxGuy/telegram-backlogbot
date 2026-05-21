@@ -1621,7 +1621,7 @@ async def main() -> None:
     if not api_id or not api_hash:
         raise RuntimeError("Missing TG_API_ID/TG_API_HASH env vars")
 
-    app_name = os.getenv("FLY_APP_NAME", "testing")
+    app_name = os.getenv("FLY_APP_NAME", "Docker")
     commit_hash = os.getenv("COMMIT_HASH", "unknown")
 
     app = Client(
