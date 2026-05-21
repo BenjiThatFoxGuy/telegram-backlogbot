@@ -10,8 +10,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from async_pymongo import AsyncClient
 from dotenv import load_dotenv
+from motor.motor_asyncio import AsyncIOMotorClient
 from pyrogram import Client
 from pyrogram.errors import FloodWait
 from pymongo import ReturnDocument
@@ -405,7 +405,7 @@ def _floodwait_seconds(e: FloodWait) -> int:
 # -----------------------------
 
 class BacklogStore:
-    def __init__(self, conn: AsyncClient, db_name: str):
+    def __init__(self, conn: AsyncIOMotorClient, db_name: str):
         self._db = conn[db_name]
         self.targets = self._db["targets"]
         self.items = self._db["items"]
@@ -1606,7 +1606,7 @@ async def main() -> None:
 
     # Mongo
     logger.info("Connecting to mongo (db=%s) ...", cfg.backlog_state_db)
-    conn = AsyncClient(cfg.mongo_url)
+    conn = AsyncIOMotorClient(cfg.mongo_url)
     store = BacklogStore(conn, cfg.backlog_state_db)
     try:
         await store.ensure_indexes()
