@@ -1,0 +1,16 @@
+# Local dev / Codespaces convenience folders
+backlog/
+backlog_archive/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db

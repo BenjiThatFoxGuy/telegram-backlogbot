@@ -1,0 +1,29 @@
+version: "3.8"
+
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile
+    volumes:
+      - ..:/workspaces/telegram-backlogbot:cached
+    working_dir: /workspaces/telegram-backlogbot
+    environment:
+      # Local Mongo in the devcontainer network
+      MONGO_URL: mongodb://mongo:27017
+      # Defaults (override in Codespaces secrets as needed)
+      BACKLOG_ROOT: /workspaces/telegram-backlogbot/backlog
+      BACKLOG_ARCHIVE_ROOT: /workspaces/telegram-backlogbot/backlog_archive
+    depends_on:
+      - mongo
+    # Keep container running for VS Code
+    command: sleep infinity
+
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongo-data:/data/db
+
+volumes:
+  mongo-data:
