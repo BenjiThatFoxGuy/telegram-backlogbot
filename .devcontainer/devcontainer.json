@@ -18,7 +18,7 @@
 
   "postCreateCommand": "python -m pip install -r requirements.txt",
 
-  "postStartCommand": "bash -lc 'set -euo pipefail; if [ -n \"${TAILSCALE_AUTHKEY:-}\" ]; then sudo mkdir -p /var/run/tailscale; sudo tailscaled --tun=userspace-networking --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock >/tmp/tailscaled.log 2>&1 & sleep 1; sudo tailscale --socket=/var/run/tailscale/tailscaled.sock up --authkey=\"$TAILSCALE_AUTHKEY\" --hostname=\"codespace-telegram-backlogbot\" --accept-dns=false --accept-routes=true; else echo "TAILSCALE_AUTHKEY not set; skipping tailscale up"; fi'",
+  "postStartCommand": "bash -lc 'set -euo pipefail; if [ -n \"${TAILSCALE_AUTHKEY:-}\" ]; then sudo mkdir -p /var/run/tailscale; sudo tailscaled --tun=userspace-networking --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock >/tmp/tailscaled.log 2>&1 & sleep 1; sudo tailscale --socket=/var/run/tailscale/tailscaled.sock up --authkey=\"$TAILSCALE_AUTHKEY\" --hostname=\"codespace-telegram-backlogbot\" --accept-dns=false --accept-routes=true; else echo TAILSCALE_AUTHKEY not set; skipping tailscale up; fi'",
 
   "remoteEnv": {
     "PYTHONUNBUFFERED": "1"
