@@ -25,6 +25,22 @@ docker run --rm \
   backlogbot
 ```
 
+## Codespaces (development)
+
+This repo includes a devcontainer configuration under `.devcontainer/` that works in GitHub Codespaces (and locally with the Dev Containers extension).
+
+What you get:
+
+- A development container with Python deps + `ffmpeg` installed.
+- A MongoDB service via `docker-compose` (the devcontainer defaults `MONGO_URL` to `mongodb://mongo:27017`).
+- Optional Tailscale installed and auto-connected on start **if** you provide a Codespaces secret `TAILSCALE_AUTHKEY` (recommend using an ephemeral key).
+
+After creating/rebuilding the Codespace, run the bot from the integrated terminal:
+
+```bash
+python backlogbot.py
+```
+
 ## Configuration (environment variables)
 
 ### Required
