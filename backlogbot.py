@@ -213,6 +213,21 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def as_aware_utc(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except Exception:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
@@ -483,7 +498,7 @@ async def resolve_peer_id(app: Client, store: BacklogStore, target_key: str, all
             if not str(n).startswith("-100"):
                 try_tokens.append(f"-100{str(n).lstrip('-')}".replace("--", "-"))
         except Exception:
-            pass
+            try_tokens.append(f"@{allowlist_token}")
 
     last_exc: Optional[Exception] = None
     for tok in try_tokens:
@@ -581,20 +596,14 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore) -> None:
         # We defer resolution to posting; for scanning we require that folder_name matches some allowlist token
         # OR is numeric / @-username, otherwise quarantine.
 
-        looks_like_target = folder_name.startswith("@") or re.fullmatch(r"-?\d+", folder_name) is not None
-        if not looks_like_target:
-            logger.info("scan_backlog: folder %s not target-like; quarantining files (if any)", folder_name)
-            # Not a target-like folder; quarantine its contents.
-            files = [p for p in child.iterdir() if p.is_file()]
-            if files:
-                await quarantine_paths(cfg, reason="unmapped_target", target_bucket=folder_name, paths=files)
-            continue
-
         canonical_target = alias_map.get(folder_name)
         if canonical_target is None:
+            looks_like_target = folder_name.startswith("@") or re.fullmatch(r"-?\d+", folder_name) is not None
+            reason = "not allowlisted/mappable" if looks_like_target else "not target-like"
             logger.info(
-                "scan_backlog: folder %s not allowlisted/mappable; quarantining files (if any)",
+                "scan_backlog: folder %s %s; quarantining files (if any)",
                 folder_name,
+                reason,
             )
             # Folder exists but not allowlisted/mappable: quarantine contents.
             files = [p for p in child.iterdir() if p.is_file()]
@@ -678,6 +687,7 @@ async def send_one_item(
     peer_id: int,
     *,
     schedule_date: Optional[datetime] = None,
+    apply_success_action: bool = True,
 ) -> Tuple[bool, Optional[int], Optional[str]]:
     """Send or schedule one item. Returns (success, message_id, error)."""
     rel_path = item["rel_path"]
@@ -748,9 +758,9 @@ async def send_one_item(
 
         message_id = int(getattr(msg, "id", 0)) if msg else None
 
-        # Apply success local FS action
-        sidecars = [sidecar] if sidecar.exists() else []
-        await handle_success(cfg, target_key=target_key, media=media_path, sidecars=sidecars)
+        if apply_success_action:
+            sidecars = [sidecar] if sidecar.exists() else []
+            await handle_success(cfg, target_key=target_key, media=media_path, sidecars=sidecars)
         return True, message_id, None
 
     except FloodWait as e:
@@ -761,24 +771,57 @@ async def send_one_item(
 
 
 async def should_post_now(cfg: BacklogConfig, target_doc: Dict[str, Any]) -> bool:
-    last = target_doc.get("last_post_at")
-    if last is None:
+    last_dt = as_aware_utc(target_doc.get("last_post_at"))
+    if last_dt is None:
         return True
-    if isinstance(last, str):
-        # tolerate older formats
-        try:
-            last_dt = datetime.fromisoformat(last)
-            if last_dt.tzinfo is None:
-                last_dt = last_dt.replace(tzinfo=timezone.utc)
-        except Exception:
-            return True
-    else:
-        last_dt = last
 
     due_at = last_dt + timedelta(seconds=cfg.interval_seconds)
     if now_utc() >= due_at:
         return True
     return False
+
+
+def next_scheduler_slot(cfg: BacklogConfig, last_scheduled_at: Optional[datetime]) -> datetime:
+    earliest = now_utc() + timedelta(seconds=cfg.min_schedule_delay_seconds)
+    if last_scheduled_at is None:
+        return earliest
+
+    candidate = last_scheduled_at + timedelta(seconds=cfg.interval_seconds)
+    if candidate >= earliest:
+        return candidate
+
+    if cfg.overdue == "wait":
+        missed_slots = int((earliest - candidate).total_seconds() // cfg.interval_seconds) + 1
+        return candidate + timedelta(seconds=missed_slots * cfg.interval_seconds)
+
+    return earliest
+
+
+async def mark_post_success(
+    cfg: BacklogConfig,
+    store: BacklogStore,
+    item: Dict[str, Any],
+    *,
+    message_id: Optional[int],
+    posted_at: Optional[datetime] = None,
+) -> None:
+    target_key = item["target_key"]
+    media = cfg.backlog_root / item["rel_path"]
+    sidecar = caption_sidecar_for(media)
+    sidecars = [sidecar] if sidecar.exists() else []
+    await handle_success(cfg, target_key=target_key, media=media, sidecars=sidecars)
+    posted_at = posted_at or now_utc()
+    await store.set_item_status(
+        item["_id"],
+        "posted",
+        posted_message_id=message_id,
+        posted_at=posted_at,
+        scheduled_message_id=None,
+    )
+    await store.targets.update_one(
+        {"_id": target_key},
+        {"$set": {"last_post_at": posted_at, "updated_at": now_utc()}},
+    )
 
 
 async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client) -> None:
@@ -814,7 +857,14 @@ async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client)
                 continue
 
             peer_id = await resolve_peer_id(app, store, target_key, target_key)
-            ok, msg_id, err = await send_one_item(cfg, store, app, item, peer_id)
+            ok, msg_id, err = await send_one_item(
+                cfg,
+                store,
+                app,
+                item,
+                peer_id,
+                apply_success_action=False,
+            )
             if ok:
                 logger.info(
                     "direct_post_loop: posted target=%s rel=%s msg_id=%s",
@@ -822,8 +872,7 @@ async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client)
                     item.get("rel_path"),
                     msg_id,
                 )
-                await store.set_item_status(item["_id"], "posted", posted_message_id=msg_id, posted_at=now_utc())
-                await store.targets.update_one({"_id": target_key}, {"$set": {"last_post_at": now_utc()}})
+                await mark_post_success(cfg, store, item, message_id=msg_id)
             else:
                 logger.warning(
                     "direct_post_loop: send failed target=%s rel=%s err=%s",
@@ -856,7 +905,14 @@ async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client)
                 continue
 
             peer_id = await resolve_peer_id(app, store, target_key, target_key)
-            ok, msg_id, err = await send_one_item(cfg, store, app, item, peer_id)
+            ok, msg_id, err = await send_one_item(
+                cfg,
+                store,
+                app,
+                item,
+                peer_id,
+                apply_success_action=False,
+            )
             if ok:
                 logger.info(
                     "direct_post_loop: posted target=%s rel=%s msg_id=%s",
@@ -864,8 +920,7 @@ async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client)
                     item.get("rel_path"),
                     msg_id,
                 )
-                await store.set_item_status(item["_id"], "posted", posted_message_id=msg_id, posted_at=now_utc())
-                await store.targets.update_one({"_id": target_key}, {"$set": {"last_post_at": now_utc()}})
+                await mark_post_success(cfg, store, item, message_id=msg_id)
             else:
                 logger.warning(
                     "direct_post_loop: send failed target=%s rel=%s err=%s",
@@ -885,17 +940,26 @@ async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client)
         await asyncio.sleep(cfg.scan_every_seconds)
 
 
-async def scheduler_reconcile(app: Client, store: BacklogStore, target_key: str) -> None:
+async def scheduler_reconcile(cfg: BacklogConfig, app: Client, store: BacklogStore, target_key: str) -> None:
     """Fetch scheduled messages and reconcile DB. Best-effort."""
     # Pyrogram API varies; guard to avoid crashes.
     getter = getattr(app, "get_scheduled_messages", None)
     if getter is None:
         logger.warning("Pyrogram client has no get_scheduled_messages; skipping reconciliation")
+        async for item in store.items.find({"target_key": target_key, "status": "scheduled"}):
+            scheduled_at = as_aware_utc(item.get("scheduled_at"))
+            if scheduled_at is not None and scheduled_at <= now_utc():
+                await mark_post_success(
+                    cfg,
+                    store,
+                    item,
+                    message_id=item.get("scheduled_message_id"),
+                    posted_at=scheduled_at,
+                )
         return
 
-    # target_key is canonical allowlist token. Use it directly; Pyrogram accepts username or id.
     try:
-        scheduled = await getter(target_key)
+        scheduled = await getter(_target_token_for_pyrogram(target_key))
     except Exception as e:
         logger.warning("Failed to fetch scheduled messages for %s: %s", target_key, e)
         return
@@ -907,13 +971,31 @@ async def scheduler_reconcile(app: Client, store: BacklogStore, target_key: str)
         if mid is not None:
             existing_ids.add(int(mid))
 
-    # Mark DB items scheduled if their message id still exists.
-    # If DB says scheduled but id is missing, revert to pending (so we can re-schedule).
+    # If a future scheduled message disappeared, assume it was cancelled and requeue it.
+    # If the scheduled time has passed and Telegram no longer lists it, treat it as posted.
     async for item in store.items.find({"target_key": target_key, "status": "scheduled"}):
         mid = item.get("scheduled_message_id")
         if isinstance(mid, int) and mid in existing_ids:
             continue
-        await store.set_item_status(item["_id"], "pending", scheduled_message_id=None)
+
+        scheduled_at = as_aware_utc(item.get("scheduled_at"))
+        if scheduled_at is not None and scheduled_at <= now_utc():
+            await mark_post_success(cfg, store, item, message_id=mid, posted_at=scheduled_at)
+            logger.info(
+                "scheduler_reconcile: marked posted target=%s rel=%s scheduled_at=%s",
+                target_key,
+                item.get("rel_path"),
+                scheduled_at,
+            )
+            continue
+
+        await store.set_item_status(
+            item["_id"],
+            "pending",
+            scheduled_message_id=None,
+            scheduled_at=None,
+            next_attempt_at=now_utc(),
+        )
 
 
 async def telegram_scheduler_loop(cfg: BacklogConfig, store: BacklogStore, app: Client) -> None:
@@ -930,29 +1012,14 @@ async def telegram_scheduler_loop(cfg: BacklogConfig, store: BacklogStore, app: 
 
         for target_key in allowlist:
             # reconcile scheduled queue in TG
-            await scheduler_reconcile(app, store, target_key)
+            await scheduler_reconcile(cfg, app, store, target_key)
 
             target_doc = await store.get_or_create_target(target_key)
             peer_id = await resolve_peer_id(app, store, target_key, target_key)
 
             # determine last scheduled anchor
-            last_sched = target_doc.get("last_scheduled_at")
-            if last_sched is None:
-                last_sched_dt = None
-            elif isinstance(last_sched, str):
-                try:
-                    last_sched_dt = datetime.fromisoformat(last_sched)
-                    if last_sched_dt.tzinfo is None:
-                        last_sched_dt = last_sched_dt.replace(tzinfo=timezone.utc)
-                except Exception:
-                    last_sched_dt = None
-            else:
-                last_sched_dt = last_sched
-
-            next_time = max(
-                now_utc() + timedelta(seconds=cfg.min_schedule_delay_seconds),
-                (last_sched_dt + timedelta(seconds=cfg.interval_seconds)) if last_sched_dt else now_utc() + timedelta(seconds=cfg.min_schedule_delay_seconds),
-            )
+            last_sched_dt = as_aware_utc(target_doc.get("last_scheduled_at"))
+            next_time = next_scheduler_slot(cfg, last_sched_dt)
 
             # Schedule items until horizon
             while next_time <= horizon:
@@ -967,6 +1034,7 @@ async def telegram_scheduler_loop(cfg: BacklogConfig, store: BacklogStore, app: 
                     item,
                     peer_id,
                     schedule_date=next_time,
+                    apply_success_action=False,
                 )
 
                 if ok:
