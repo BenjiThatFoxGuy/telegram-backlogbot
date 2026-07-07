@@ -341,8 +341,13 @@ def safe_delete(path: Path) -> None:
         path.unlink(missing_ok=True)  # type: ignore[attr-defined]
     except TypeError:
         # Python <3.8 compatibility (not expected here, but safe)
-        if path.exists():
-            path.unlink()
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError as e:
+            logger.exception("Failed to delete %s: %s", path, e)
+    except OSError as e:
+        logger.exception("Failed to delete %s: %s", path, e)
 
 
 def is_stable_file(path: Path, settle_seconds: int) -> bool:
@@ -794,6 +799,12 @@ async def handle_success(cfg: BacklogConfig, *, target_key: str, media: Path, si
         return
 
 
+def is_leftover_of_posted_item(existing: Dict[str, Any], current_rel_path: str) -> bool:
+    """True if a rediscovered file is the same already-posted item (cleanup failed
+    earlier), as opposed to a genuinely separate file with identical content."""
+    return existing.get("rel_path") == current_rel_path
+
+
 def rel_path_from_any_root(cfg: BacklogConfig, path: Path) -> str:
     """Return a rel_path for a file under any configured backlog root."""
     for root in cfg.backlog_roots:
@@ -989,10 +1000,33 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore, app: Optional[Cl
                     sha_for_dedup = None
 
                 if existing and existing.get("status") == "posted":
+                    current_rel = rel_path_from_any_root(cfg, p)
+                    if is_leftover_of_posted_item(existing, current_rel):
+                        # Same file, same path, already marked posted: this is a
+                        # leftover from a post-success cleanup failure, not a true
+                        # duplicate. Retry cleanup instead of quarantining it.
+                        logger.warning(
+                            "scan_backlog: leftover posted file still on disk; retrying cleanup target=%s rel=%s sha=%s",
+                            target_key,
+                            current_rel,
+                            (sha_for_dedup or "")[:12],
+                        )
+                        sidecar = caption_sidecar_for(p)
+                        sidecars = [sidecar] if sidecar.exists() else []
+                        try:
+                            await handle_success(cfg, target_key=target_key, media=p, sidecars=sidecars)
+                        except Exception:
+                            logger.exception(
+                                "scan_backlog: retry cleanup failed for leftover posted file target=%s rel=%s",
+                                target_key,
+                                current_rel,
+                            )
+                        continue
+
                     logger.info(
                         "scan_backlog: duplicate content; quarantining target=%s rel=%s sha=%s existing_status=%s existing_rel=%s",
                         target_key,
-                        rel_path_from_any_root(cfg, p),
+                        current_rel,
                         (sha_for_dedup or "")[:12],
                         existing.get("status"),
                         existing.get("rel_path"),
@@ -1170,11 +1204,11 @@ async def mark_post_success(
     posted_at: Optional[datetime] = None,
 ) -> None:
     target_key = item["target_key"]
-    media = resolve_media_path(cfg, item["rel_path"])
-    sidecar = caption_sidecar_for(media)
-    sidecars = [sidecar] if sidecar.exists() else []
-    await handle_success(cfg, target_key=target_key, media=media, sidecars=sidecars)
     posted_at = posted_at or now_utc()
+
+    # Persist the irreversible fact FIRST: a Telegram message already exists for
+    # this item. Once this write lands, the item can never be re-enqueued/reposted,
+    # regardless of what happens to local file cleanup below.
     await store.set_item_status(
         item["_id"],
         "posted",
@@ -1186,6 +1220,23 @@ async def mark_post_success(
         {"_id": target_key},
         {"$set": {"last_post_at": posted_at, "updated_at": now_utc()}},
     )
+
+    # Best-effort local cleanup. Must never undo the guarantee above or crash the
+    # caller: log loudly on failure and move on.
+    media = resolve_media_path(cfg, item["rel_path"])
+    sidecar = caption_sidecar_for(media)
+    sidecars = [sidecar] if sidecar.exists() else []
+    try:
+        await handle_success(cfg, target_key=target_key, media=media, sidecars=sidecars)
+    except Exception:
+        logger.exception(
+            "mark_post_success: post-success cleanup failed (item already marked "
+            "posted; file may be left in place) item_id=%s target=%s rel_path=%s action=%s",
+            item["_id"],
+            target_key,
+            item["rel_path"],
+            cfg.success_action,
+        )
 
 
 async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client) -> None:
@@ -1243,42 +1294,50 @@ async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client)
                     await asyncio.sleep(5)
                     continue
 
-            peer_id = await resolve_peer_id(app, store, target_key, target_key)
-            ok, msg_id, err = await send_one_item(
-                cfg,
-                store,
-                app,
-                item,
-                peer_id,
-                apply_success_action=False,
-            )
-            if cfg.immediate_post_on_start and target_key not in posted_immediately_for:
-                posted_immediately_for.add(target_key)
-            if ok:
-                logger.info(
-                    "direct_post_loop: posted target=%s rel=%s msg_id=%s",
+            try:
+                peer_id = await resolve_peer_id(app, store, target_key, target_key)
+                ok, msg_id, err = await send_one_item(
+                    cfg,
+                    store,
+                    app,
+                    item,
+                    peer_id,
+                    apply_success_action=False,
+                )
+                if cfg.immediate_post_on_start and target_key not in posted_immediately_for:
+                    posted_immediately_for.add(target_key)
+                if ok:
+                    logger.info(
+                        "direct_post_loop: posted target=%s rel=%s msg_id=%s",
+                        target_key,
+                        item.get("rel_path"),
+                        msg_id,
+                    )
+                    await mark_post_success(cfg, store, item, message_id=msg_id)
+                else:
+                    logger.warning(
+                        "direct_post_loop: send failed target=%s rel=%s err=%s",
+                        target_key,
+                        item.get("rel_path"),
+                        err,
+                    )
+                    updated = await store.bump_failure(item["_id"], err or "unknown", retry_after_seconds=cfg.scan_every_seconds)
+                    failure_limit = MISSING_FILE_MAX_RETRIES if err and err.startswith("missing file:") else cfg.max_failures
+                    if updated and int(updated.get("fail_count", 0)) >= failure_limit:
+                        # move file to failed archive bucket
+                        rel = updated["rel_path"]
+                        media = resolve_media_path(cfg, rel)
+                        sidecar = caption_sidecar_for(media)
+                        paths = [media] + ([sidecar] if sidecar.exists() else [])
+                        await archive_paths(cfg, bucket="_failed", target_key=target_key, paths=paths)
+                        await store.set_item_status(item["_id"], "failed")
+            except Exception:
+                logger.exception(
+                    "direct_post_loop: unhandled error processing item (global) target=%s rel=%s item_id=%s",
                     target_key,
                     item.get("rel_path"),
-                    msg_id,
+                    item.get("_id"),
                 )
-                await mark_post_success(cfg, store, item, message_id=msg_id)
-            else:
-                logger.warning(
-                    "direct_post_loop: send failed target=%s rel=%s err=%s",
-                    target_key,
-                    item.get("rel_path"),
-                    err,
-                )
-                updated = await store.bump_failure(item["_id"], err or "unknown", retry_after_seconds=cfg.scan_every_seconds)
-                failure_limit = MISSING_FILE_MAX_RETRIES if err and err.startswith("missing file:") else cfg.max_failures
-                if updated and int(updated.get("fail_count", 0)) >= failure_limit:
-                    # move file to failed archive bucket
-                    rel = updated["rel_path"]
-                    media = resolve_media_path(cfg, rel)
-                    sidecar = caption_sidecar_for(media)
-                    paths = [media] + ([sidecar] if sidecar.exists() else [])
-                    await archive_paths(cfg, bucket="_failed", target_key=target_key, paths=paths)
-                    await store.set_item_status(item["_id"], "failed")
             await asyncio.sleep(1)
             continue
 
@@ -1299,44 +1358,53 @@ async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client)
                             target_key,
                             item.get("rel_path"),
                         )
-                        peer_id = await resolve_peer_id(app, store, target_key, target_key)
-                        ok, msg_id, err = await send_one_item(
-                            cfg,
-                            store,
-                            app,
-                            item,
-                            peer_id,
-                            apply_success_action=False,
-                        )
-                        posted_immediately_for.add(target_key)
-                        if ok:
-                            logger.info(
-                                "direct_post_loop: posted (startup) target=%s rel=%s msg_id=%s",
+                        try:
+                            peer_id = await resolve_peer_id(app, store, target_key, target_key)
+                            ok, msg_id, err = await send_one_item(
+                                cfg,
+                                store,
+                                app,
+                                item,
+                                peer_id,
+                                apply_success_action=False,
+                            )
+                            posted_immediately_for.add(target_key)
+                            if ok:
+                                logger.info(
+                                    "direct_post_loop: posted (startup) target=%s rel=%s msg_id=%s",
+                                    target_key,
+                                    item.get("rel_path"),
+                                    msg_id,
+                                )
+                                await mark_post_success(cfg, store, item, message_id=msg_id)
+                            else:
+                                logger.warning(
+                                    "direct_post_loop: send failed (startup) target=%s rel=%s err=%s",
+                                    target_key,
+                                    item.get("rel_path"),
+                                    err,
+                                )
+                                updated = await store.bump_failure(
+                                    item["_id"],
+                                    err or "unknown",
+                                    retry_after_seconds=cfg.scan_every_seconds,
+                                )
+                                failure_limit = MISSING_FILE_MAX_RETRIES if err and err.startswith("missing file:") else cfg.max_failures
+                                if updated and int(updated.get("fail_count", 0)) >= failure_limit:
+                                    rel = updated["rel_path"]
+                                    media = resolve_media_path(cfg, rel)
+                                    sidecar = caption_sidecar_for(media)
+                                    paths = [media] + ([sidecar] if sidecar.exists() else [])
+                                    await archive_paths(cfg, bucket="_failed", target_key=target_key, paths=paths)
+                                    await store.set_item_status(item["_id"], "failed")
+                        except Exception:
+                            logger.exception(
+                                "direct_post_loop: unhandled error processing item (startup) target=%s rel=%s item_id=%s",
                                 target_key,
                                 item.get("rel_path"),
-                                msg_id,
+                                item.get("_id"),
                             )
-                            await mark_post_success(cfg, store, item, message_id=msg_id)
-                        else:
-                            logger.warning(
-                                "direct_post_loop: send failed (startup) target=%s rel=%s err=%s",
-                                target_key,
-                                item.get("rel_path"),
-                                err,
-                            )
-                            updated = await store.bump_failure(
-                                item["_id"],
-                                err or "unknown",
-                                retry_after_seconds=cfg.scan_every_seconds,
-                            )
-                            failure_limit = MISSING_FILE_MAX_RETRIES if err and err.startswith("missing file:") else cfg.max_failures
-                            if updated and int(updated.get("fail_count", 0)) >= failure_limit:
-                                rel = updated["rel_path"]
-                                media = resolve_media_path(cfg, rel)
-                                sidecar = caption_sidecar_for(media)
-                                paths = [media] + ([sidecar] if sidecar.exists() else [])
-                                await archive_paths(cfg, bucket="_failed", target_key=target_key, paths=paths)
-                                await store.set_item_status(item["_id"], "failed")
+                            posted_immediately_for.add(target_key)
                         # Continue to next target; do not also run defer logic this tick.
                         continue
 
@@ -1360,39 +1428,47 @@ async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client)
                 logger.debug("direct_post_loop: no due item for target=%s", target_key)
                 continue
 
-            peer_id = await resolve_peer_id(app, store, target_key, target_key)
-            ok, msg_id, err = await send_one_item(
-                cfg,
-                store,
-                app,
-                item,
-                peer_id,
-                apply_success_action=False,
-            )
-            if ok:
-                logger.info(
-                    "direct_post_loop: posted target=%s rel=%s msg_id=%s",
+            try:
+                peer_id = await resolve_peer_id(app, store, target_key, target_key)
+                ok, msg_id, err = await send_one_item(
+                    cfg,
+                    store,
+                    app,
+                    item,
+                    peer_id,
+                    apply_success_action=False,
+                )
+                if ok:
+                    logger.info(
+                        "direct_post_loop: posted target=%s rel=%s msg_id=%s",
+                        target_key,
+                        item.get("rel_path"),
+                        msg_id,
+                    )
+                    await mark_post_success(cfg, store, item, message_id=msg_id)
+                else:
+                    logger.warning(
+                        "direct_post_loop: send failed target=%s rel=%s err=%s",
+                        target_key,
+                        item.get("rel_path"),
+                        err,
+                    )
+                    updated = await store.bump_failure(item["_id"], err or "unknown", retry_after_seconds=cfg.scan_every_seconds)
+                    failure_limit = MISSING_FILE_MAX_RETRIES if err and err.startswith("missing file:") else cfg.max_failures
+                    if updated and int(updated.get("fail_count", 0)) >= failure_limit:
+                        rel = updated["rel_path"]
+                        media = resolve_media_path(cfg, rel)
+                        sidecar = caption_sidecar_for(media)
+                        paths = [media] + ([sidecar] if sidecar.exists() else [])
+                        await archive_paths(cfg, bucket="_failed", target_key=target_key, paths=paths)
+                        await store.set_item_status(item["_id"], "failed")
+            except Exception:
+                logger.exception(
+                    "direct_post_loop: unhandled error processing item target=%s rel=%s item_id=%s",
                     target_key,
                     item.get("rel_path"),
-                    msg_id,
+                    item.get("_id"),
                 )
-                await mark_post_success(cfg, store, item, message_id=msg_id)
-            else:
-                logger.warning(
-                    "direct_post_loop: send failed target=%s rel=%s err=%s",
-                    target_key,
-                    item.get("rel_path"),
-                    err,
-                )
-                updated = await store.bump_failure(item["_id"], err or "unknown", retry_after_seconds=cfg.scan_every_seconds)
-                failure_limit = MISSING_FILE_MAX_RETRIES if err and err.startswith("missing file:") else cfg.max_failures
-                if updated and int(updated.get("fail_count", 0)) >= failure_limit:
-                    rel = updated["rel_path"]
-                    media = resolve_media_path(cfg, rel)
-                    sidecar = caption_sidecar_for(media)
-                    paths = [media] + ([sidecar] if sidecar.exists() else [])
-                    await archive_paths(cfg, bucket="_failed", target_key=target_key, paths=paths)
-                    await store.set_item_status(item["_id"], "failed")
 
         await asyncio.sleep(cfg.scan_every_seconds)
 
@@ -1404,14 +1480,22 @@ async def scheduler_reconcile(cfg: BacklogConfig, app: Client, store: BacklogSto
     if getter is None:
         logger.warning("Pyrogram client has no get_scheduled_messages; skipping reconciliation")
         async for item in store.items.find({"target_key": target_key, "status": "scheduled"}):
-            scheduled_at = as_aware_utc(item.get("scheduled_at"))
-            if scheduled_at is not None and scheduled_at <= now_utc():
-                await mark_post_success(
-                    cfg,
-                    store,
-                    item,
-                    message_id=item.get("scheduled_message_id"),
-                    posted_at=scheduled_at,
+            try:
+                scheduled_at = as_aware_utc(item.get("scheduled_at"))
+                if scheduled_at is not None and scheduled_at <= now_utc():
+                    await mark_post_success(
+                        cfg,
+                        store,
+                        item,
+                        message_id=item.get("scheduled_message_id"),
+                        posted_at=scheduled_at,
+                    )
+            except Exception:
+                logger.exception(
+                    "scheduler_reconcile: unhandled error reconciling (fallback) target=%s rel=%s item_id=%s",
+                    target_key,
+                    item.get("rel_path"),
+                    item.get("_id"),
                 )
         return
 
@@ -1435,24 +1519,32 @@ async def scheduler_reconcile(cfg: BacklogConfig, app: Client, store: BacklogSto
         if isinstance(mid, int) and mid in existing_ids:
             continue
 
-        scheduled_at = as_aware_utc(item.get("scheduled_at"))
-        if scheduled_at is not None and scheduled_at <= now_utc():
-            await mark_post_success(cfg, store, item, message_id=mid, posted_at=scheduled_at)
-            logger.info(
-                "scheduler_reconcile: marked posted target=%s rel=%s scheduled_at=%s",
+        try:
+            scheduled_at = as_aware_utc(item.get("scheduled_at"))
+            if scheduled_at is not None and scheduled_at <= now_utc():
+                await mark_post_success(cfg, store, item, message_id=mid, posted_at=scheduled_at)
+                logger.info(
+                    "scheduler_reconcile: marked posted target=%s rel=%s scheduled_at=%s",
+                    target_key,
+                    item.get("rel_path"),
+                    scheduled_at,
+                )
+                continue
+
+            await store.set_item_status(
+                item["_id"],
+                "pending",
+                scheduled_message_id=None,
+                scheduled_at=None,
+                next_attempt_at=now_utc(),
+            )
+        except Exception:
+            logger.exception(
+                "scheduler_reconcile: unhandled error reconciling target=%s rel=%s item_id=%s",
                 target_key,
                 item.get("rel_path"),
-                scheduled_at,
+                item.get("_id"),
             )
-            continue
-
-        await store.set_item_status(
-            item["_id"],
-            "pending",
-            scheduled_message_id=None,
-            scheduled_at=None,
-            next_attempt_at=now_utc(),
-        )
 
 
 async def telegram_scheduler_loop(cfg: BacklogConfig, store: BacklogStore, app: Client) -> None:
