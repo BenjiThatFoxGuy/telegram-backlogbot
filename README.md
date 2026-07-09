@@ -73,6 +73,11 @@ items without that cleanup marker are caught up on later scheduler ticks.
 
 - `BACKLOG_MAX_FAILURES` (default: `5`)
 
+Unsupported folders, duplicate/disallowed files, and permanently rejected Telegram
+media uploads such as `PHOTO_SAVE_FILE_INVALID` are moved under
+`BACKLOG_ARCHIVE_ROOT/_quarantine/<reason>/<target>/` and marked `quarantined`
+in state.
+
 ### Logging
 
 - `BACKLOG_LOG_LEVEL` (default: `INFO`)

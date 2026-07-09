@@ -200,6 +200,75 @@ class CleanupScheduledLocalFilesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.marked, ["item1"])
 
 
+class SendFailureQuarantineTests(unittest.IsolatedAsyncioTestCase):
+    def test_photo_save_file_invalid_is_quarantinable(self):
+        err = (
+            "PhotoSaveFileInvalid: Telegram says: [400 PHOTO_SAVE_FILE_INVALID] "
+            "(caused by \"messages.SendMedia\")"
+        )
+
+        self.assertEqual(
+            backlogbot.quarantine_reason_for_send_error(err),
+            "telegram_photo_save_file_invalid",
+        )
+
+    def test_peer_id_invalid_is_not_media_quarantine(self):
+        err = "PeerIdInvalid: Telegram says: [400 PEER_ID_INVALID]"
+
+        self.assertIsNone(backlogbot.quarantine_reason_for_send_error(err))
+
+    async def test_handle_send_failure_quarantines_file_and_sidecar(self):
+        class Store:
+            def __init__(self):
+                self.status_updates = []
+
+            async def set_item_status(self, *args, **kwargs):
+                self.status_updates.append((args, kwargs))
+
+            async def bump_failure(self, *args, **kwargs):
+                raise AssertionError("permanent media errors should not be retried")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "backlog"
+            archive = Path(tmp) / "archive"
+            target_dir = root / "@chan"
+            target_dir.mkdir(parents=True)
+            media = target_dir / "bad.png"
+            sidecar = target_dir / "bad.png.caption.txt"
+            media.write_bytes(b"bad image")
+            sidecar.write_text("caption", encoding="utf-8")
+
+            cfg = replace(make_cfg(), backlog_root=root, backlog_roots=[root], archive_root=archive)
+            item = {
+                "_id": "item1",
+                "target_key": "@chan",
+                "rel_path": "@chan/bad.png",
+            }
+            store = Store()
+
+            with patch.object(backlogbot.logger, "warning"):
+                quarantined = await backlogbot.handle_send_failure(
+                    cfg,
+                    store,
+                    item,
+                    error="PhotoSaveFileInvalid: Telegram says: [400 PHOTO_SAVE_FILE_INVALID]",
+                    context="test",
+                )
+
+            quarantine_dir = archive / "_quarantine" / "telegram_photo_save_file_invalid" / "@chan"
+            self.assertTrue(quarantined)
+            self.assertFalse(media.exists())
+            self.assertFalse(sidecar.exists())
+            self.assertTrue((quarantine_dir / "bad.png").exists())
+            self.assertTrue((quarantine_dir / "bad.png.caption.txt").exists())
+
+            args, kwargs = store.status_updates[0]
+            self.assertEqual(args, ("item1", "quarantined"))
+            self.assertEqual(kwargs["quarantine_reason"], "telegram_photo_save_file_invalid")
+            self.assertIsNone(kwargs["scheduled_message_id"])
+            self.assertIsNone(kwargs["scheduled_at"])
+
+
 class SchedulerReconcileTests(unittest.IsolatedAsyncioTestCase):
     async def test_fetches_pyrofork_scheduled_messages_by_tracked_ids(self):
         cfg = make_cfg()
@@ -259,6 +328,63 @@ class SchedulerReconcileTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.calls, [(-1004448064069, [99])])
         self.assertEqual(store.status_updates, [])
         self.assertEqual(len(store.items.queries), 2)
+
+    async def test_fetches_scheduled_messages_with_cached_peer_id_for_bare_numeric_target(self):
+        cfg = make_cfg()
+        item = {
+            "_id": "item1",
+            "target_key": "4448064069",
+            "rel_path": "chan/file.jpg",
+            "status": "scheduled",
+            "scheduled_message_id": 99,
+            "scheduled_at": datetime(2099, 1, 1, tzinfo=timezone.utc),
+        }
+
+        class Message:
+            id = 99
+
+        class AsyncList:
+            def __init__(self, values):
+                self.values = list(values)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if not self.values:
+                    raise StopAsyncIteration
+                return self.values.pop(0)
+
+        class Items:
+            def find(self, query):
+                return AsyncList([item])
+
+        class Store:
+            def __init__(self):
+                self.items = Items()
+                self.status_updates = []
+
+            async def get_or_create_target(self, target_key):
+                return {"_id": target_key, "peer_id": -1004448064069}
+
+            async def set_item_status(self, *args, **kwargs):
+                self.status_updates.append((args, kwargs))
+
+        class App:
+            def __init__(self):
+                self.calls = []
+
+            async def get_scheduled_messages(self, chat_id, message_ids):
+                self.calls.append((chat_id, list(message_ids)))
+                return [Message()]
+
+        store = Store()
+        app = App()
+
+        await backlogbot.scheduler_reconcile(cfg, app, store, target_key="4448064069")
+
+        self.assertEqual(app.calls, [(-1004448064069, [99])])
+        self.assertEqual(store.status_updates, [])
 
     async def test_reconcile_supports_older_one_argument_scheduled_getter(self):
         cfg = make_cfg()

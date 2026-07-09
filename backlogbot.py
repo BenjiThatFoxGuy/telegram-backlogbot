@@ -180,6 +180,21 @@ class BacklogConfig:
 
 MISSING_FILE_MAX_RETRIES = 10
 
+QUARANTINABLE_SEND_ERROR_REASONS: Dict[str, str] = {
+    "PHOTO_SAVE_FILE_INVALID": "telegram_photo_save_file_invalid",
+    "PHOTOSAVEFILEINVALID": "telegram_photo_save_file_invalid",
+    "PHOTO_INVALID_DIMENSIONS": "telegram_photo_invalid_dimensions",
+    "PHOTOINVALIDDIMENSIONS": "telegram_photo_invalid_dimensions",
+    "PHOTO_EXT_INVALID": "telegram_photo_ext_invalid",
+    "PHOTOEXTINVALID": "telegram_photo_ext_invalid",
+    "IMAGE_PROCESS_FAILED": "telegram_image_process_failed",
+    "IMAGEPROCESSFAILED": "telegram_image_process_failed",
+    "MEDIA_EMPTY": "telegram_media_empty",
+    "MEDIAEMPTY": "telegram_media_empty",
+    "MEDIA_INVALID": "telegram_media_invalid",
+    "MEDIAINVALID": "telegram_media_invalid",
+}
+
 
 def load_config() -> BacklogConfig:
     backlog_root = Path(_env_str("BACKLOG_ROOT", "/backlog"))
@@ -416,6 +431,19 @@ def _floodwait_seconds(e: FloodWait) -> int:
             return v
     # Fallback to 0 (caller will likely treat as retry next cycle)
     return 0
+
+
+def quarantine_reason_for_send_error(error: Optional[str]) -> Optional[str]:
+    """Return a quarantine reason for Telegram errors that retrying will not fix."""
+    if not error:
+        return None
+
+    upper = error.upper()
+    compacted = re.sub(r"[^A-Z0-9]+", "", upper)
+    for needle, reason in QUARANTINABLE_SEND_ERROR_REASONS.items():
+        if needle in upper or needle in compacted:
+            return reason
+    return None
 
 
 # -----------------------------
@@ -723,6 +751,21 @@ def _target_token_for_pyrogram(token: str) -> Any:
             return token
     return token
 
+
+async def scheduled_messages_target_token(store: Any, target_key: str) -> Any:
+    get_target = getattr(store, "get_or_create_target", None)
+    if get_target is not None:
+        try:
+            target_doc = await get_target(target_key)
+            cached = target_doc.get("peer_id") if isinstance(target_doc, dict) else None
+            if isinstance(cached, int) and cached != 0:
+                return cached
+        except Exception:
+            logger.debug("scheduler_reconcile: failed to read cached peer_id for %s", target_key)
+
+    return _target_token_for_pyrogram(target_key)
+
+
 async def resolve_peer_id(app: Client, store: BacklogStore, target_key: str, allowlist_token: str) -> int:
     """Resolve and cache peer_id. allowlist_token is the configured allowlist entry."""
     target = await store.get_or_create_target(target_key)
@@ -801,6 +844,8 @@ def is_ignorable_metadata_file(path: Path) -> bool:
     if name.lower() == "thumbs.db":
         return True
     return False
+
+
 async def quarantine_paths(cfg: BacklogConfig, *, reason: str, target_bucket: str, paths: List[Path]) -> None:
     # Move each path under archive/_quarantine/<reason>/<target_bucket>/
     base = cfg.archive_root / "_quarantine" / reason / target_bucket
@@ -826,6 +871,72 @@ async def archive_paths(cfg: BacklogConfig, *, bucket: str, target_key: str, pat
             safe_move(p, dest)
         except Exception as e:
             logger.exception("Failed to archive %s to %s: %s", p, dest, e)
+
+
+async def quarantine_item(
+    cfg: BacklogConfig,
+    store: BacklogStore,
+    item: Dict[str, Any],
+    *,
+    reason: str,
+    error: Optional[str] = None,
+) -> None:
+    target_key = item["target_key"]
+    rel = item["rel_path"]
+    media = resolve_media_path(cfg, rel)
+    sidecar = caption_sidecar_for(media)
+    paths = [media] + ([sidecar] if sidecar.exists() else [])
+
+    await store.set_item_status(
+        item["_id"],
+        "quarantined",
+        last_error=error or reason,
+        quarantine_reason=reason,
+        quarantined_at=now_utc(),
+        scheduled_message_id=None,
+        scheduled_at=None,
+        next_attempt_at=None,
+    )
+    await quarantine_paths(cfg, reason=reason, target_bucket=target_key, paths=paths)
+
+
+async def handle_send_failure(
+    cfg: BacklogConfig,
+    store: BacklogStore,
+    item: Dict[str, Any],
+    *,
+    error: Optional[str],
+    context: str,
+) -> bool:
+    """Record a send failure. Return True when the item was quarantined."""
+    target_key = item["target_key"]
+    reason = quarantine_reason_for_send_error(error)
+    if reason is not None:
+        logger.warning(
+            "%s: quarantining item rejected by Telegram target=%s rel=%s reason=%s err=%s",
+            context,
+            target_key,
+            item.get("rel_path"),
+            reason,
+            error,
+        )
+        await quarantine_item(cfg, store, item, reason=reason, error=error)
+        return True
+
+    updated = await store.bump_failure(
+        item["_id"],
+        error or "unknown",
+        retry_after_seconds=cfg.scan_every_seconds,
+    )
+    failure_limit = MISSING_FILE_MAX_RETRIES if error and error.startswith("missing file:") else cfg.max_failures
+    if updated and int(updated.get("fail_count", 0)) >= failure_limit:
+        rel = updated["rel_path"]
+        media = resolve_media_path(cfg, rel)
+        sidecar = caption_sidecar_for(media)
+        paths = [media] + ([sidecar] if sidecar.exists() else [])
+        await archive_paths(cfg, bucket="_failed", target_key=target_key, paths=paths)
+        await store.set_item_status(item["_id"], "failed")
+    return False
 
 
 async def handle_success(cfg: BacklogConfig, *, target_key: str, media: Path, sidecars: List[Path]) -> None:
@@ -1473,16 +1584,13 @@ async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client)
                         item.get("rel_path"),
                         err,
                     )
-                    updated = await store.bump_failure(item["_id"], err or "unknown", retry_after_seconds=cfg.scan_every_seconds)
-                    failure_limit = MISSING_FILE_MAX_RETRIES if err and err.startswith("missing file:") else cfg.max_failures
-                    if updated and int(updated.get("fail_count", 0)) >= failure_limit:
-                        # move file to failed archive bucket
-                        rel = updated["rel_path"]
-                        media = resolve_media_path(cfg, rel)
-                        sidecar = caption_sidecar_for(media)
-                        paths = [media] + ([sidecar] if sidecar.exists() else [])
-                        await archive_paths(cfg, bucket="_failed", target_key=target_key, paths=paths)
-                        await store.set_item_status(item["_id"], "failed")
+                    await handle_send_failure(
+                        cfg,
+                        store,
+                        item,
+                        error=err,
+                        context="direct_post_loop",
+                    )
             except Exception:
                 logger.exception(
                     "direct_post_loop: unhandled error processing item (global) target=%s rel=%s item_id=%s",
@@ -1536,19 +1644,13 @@ async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client)
                                     item.get("rel_path"),
                                     err,
                                 )
-                                updated = await store.bump_failure(
-                                    item["_id"],
-                                    err or "unknown",
-                                    retry_after_seconds=cfg.scan_every_seconds,
+                                await handle_send_failure(
+                                    cfg,
+                                    store,
+                                    item,
+                                    error=err,
+                                    context="direct_post_loop(startup)",
                                 )
-                                failure_limit = MISSING_FILE_MAX_RETRIES if err and err.startswith("missing file:") else cfg.max_failures
-                                if updated and int(updated.get("fail_count", 0)) >= failure_limit:
-                                    rel = updated["rel_path"]
-                                    media = resolve_media_path(cfg, rel)
-                                    sidecar = caption_sidecar_for(media)
-                                    paths = [media] + ([sidecar] if sidecar.exists() else [])
-                                    await archive_paths(cfg, bucket="_failed", target_key=target_key, paths=paths)
-                                    await store.set_item_status(item["_id"], "failed")
                         except Exception:
                             logger.exception(
                                 "direct_post_loop: unhandled error processing item (startup) target=%s rel=%s item_id=%s",
@@ -1605,15 +1707,13 @@ async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client)
                         item.get("rel_path"),
                         err,
                     )
-                    updated = await store.bump_failure(item["_id"], err or "unknown", retry_after_seconds=cfg.scan_every_seconds)
-                    failure_limit = MISSING_FILE_MAX_RETRIES if err and err.startswith("missing file:") else cfg.max_failures
-                    if updated and int(updated.get("fail_count", 0)) >= failure_limit:
-                        rel = updated["rel_path"]
-                        media = resolve_media_path(cfg, rel)
-                        sidecar = caption_sidecar_for(media)
-                        paths = [media] + ([sidecar] if sidecar.exists() else [])
-                        await archive_paths(cfg, bucket="_failed", target_key=target_key, paths=paths)
-                        await store.set_item_status(item["_id"], "failed")
+                    await handle_send_failure(
+                        cfg,
+                        store,
+                        item,
+                        error=err,
+                        context="direct_post_loop",
+                    )
             except Exception:
                 logger.exception(
                     "direct_post_loop: unhandled error processing item target=%s rel=%s item_id=%s",
@@ -1662,7 +1762,7 @@ async def scheduler_reconcile(cfg: BacklogConfig, app: Client, store: BacklogSto
     try:
         scheduled = []
         if tracked_ids:
-            target_token = _target_token_for_pyrogram(target_key)
+            target_token = await scheduled_messages_target_token(store, target_key)
             try:
                 for i in range(0, len(tracked_ids), 200):
                     chunk = await getter(target_token, tracked_ids[i:i + 200])
@@ -1830,14 +1930,15 @@ async def telegram_scheduler_loop(cfg: BacklogConfig, store: BacklogStore, app: 
                         next_time,
                         err,
                     )
-                    updated = await store.bump_failure(item["_id"], err or "unknown", retry_after_seconds=cfg.scan_every_seconds)
-                    if updated and int(updated.get("fail_count", 0)) >= cfg.max_failures:
-                        rel = updated["rel_path"]
-                        media = resolve_media_path(cfg, rel)
-                        sidecar = caption_sidecar_for(media)
-                        paths = [media] + ([sidecar] if sidecar.exists() else [])
-                        await archive_paths(cfg, bucket="_failed", target_key=target_key, paths=paths)
-                        await store.set_item_status(item["_id"], "failed")
+                    quarantined = await handle_send_failure(
+                        cfg,
+                        store,
+                        item,
+                        error=err,
+                        context="scheduler",
+                    )
+                    if quarantined:
+                        continue
                     break
 
         await cleanup_scheduled_local_files(cfg, store)
