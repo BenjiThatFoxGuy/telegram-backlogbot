@@ -1,4 +1,7 @@
+import os
+import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -6,7 +9,7 @@ from unittest.mock import AsyncMock, patch
 import backlogbot
 
 
-def make_cfg(success_action="delete"):
+def make_cfg(success_action="delete", legacy_per_target_dedupe=False):
     return backlogbot.BacklogConfig(
         enabled=True,
         backlog_root=Path("/backlog"),
@@ -21,6 +24,7 @@ def make_cfg(success_action="delete"):
         success_action=success_action,
         allow_unknown_as_document=False,
         skip_quarantine_unmapped_targets=False,
+        legacy_per_target_dedupe=legacy_per_target_dedupe,
         immediate_post_on_start=False,
         use_telegram_scheduler=False,
         scheduler_mode="fixed_cadence",
@@ -196,14 +200,121 @@ class CleanupScheduledLocalFilesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.marked, ["item1"])
 
 
+class ConfigTests(unittest.TestCase):
+    def test_legacy_per_target_dedupe_defaults_off(self):
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = backlogbot.load_config()
+
+        self.assertFalse(cfg.legacy_per_target_dedupe)
+
+    def test_legacy_per_target_dedupe_can_be_enabled(self):
+        with patch.dict(os.environ, {"BACKLOG_LEGACY_PER_TARGET_DEDUPE": "true"}, clear=True):
+            cfg = backlogbot.load_config()
+
+        self.assertTrue(cfg.legacy_per_target_dedupe)
+
+
+class FindExistingContentItemTests(unittest.IsolatedAsyncioTestCase):
+    async def test_global_dedupe_omits_target_filter_and_returns_posted_first(self):
+        class Items:
+            def __init__(self):
+                self.queries = []
+
+            async def find_one(self, query, projection=None):
+                self.queries.append((query, projection))
+                if query.get("status") == "posted":
+                    return {"target_key": "@other", "rel_path": "other/file.jpg", "status": "posted"}
+                return None
+
+        store = object.__new__(backlogbot.BacklogStore)
+        store.items = Items()
+
+        existing = await store.find_existing_content_item(target_key=None, sha256="abc123")
+
+        self.assertEqual(existing["target_key"], "@other")
+        self.assertEqual(store.items.queries[0][0], {"sha256": "abc123", "status": "posted"})
+        self.assertNotIn("target_key", store.items.queries[0][0])
+        self.assertEqual(store.items.queries[0][1]["target_key"], 1)
+
+    async def test_legacy_dedupe_filters_by_target_key(self):
+        class Items:
+            def __init__(self):
+                self.queries = []
+
+            async def find_one(self, query, projection=None):
+                self.queries.append((query, projection))
+                return None
+
+        store = object.__new__(backlogbot.BacklogStore)
+        store.items = Items()
+
+        existing = await store.find_existing_content_item(target_key="@chan", sha256="abc123")
+
+        self.assertIsNone(existing)
+        self.assertEqual(store.items.queries[0][0]["target_key"], "@chan")
+        self.assertEqual(store.items.queries[0][0]["status"], "posted")
+        self.assertEqual(store.items.queries[1][0]["target_key"], "@chan")
+        self.assertEqual(store.items.queries[1][0]["status"], {"$in": ["pending", "scheduled"]})
+
+
+class ScanBacklogDedupeScopeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_scan_uses_global_dedupe_by_default(self):
+        store = await self._scan_with_legacy_setting(False)
+
+        self.assertEqual(store.dedupe_target_keys, [None])
+
+    async def test_scan_uses_target_dedupe_in_legacy_mode(self):
+        store = await self._scan_with_legacy_setting(True)
+
+        self.assertEqual(store.dedupe_target_keys, ["@chan"])
+
+    async def _scan_with_legacy_setting(self, legacy_per_target_dedupe):
+        class Store:
+            def __init__(self):
+                self.dedupe_target_keys = []
+
+            async def get_or_create_target(self, target_key):
+                return {"_id": target_key}
+
+            async def find_existing_content_item(self, *, target_key, sha256):
+                self.dedupe_target_keys.append(target_key)
+                return None
+
+            async def upsert_item_discovered(self, **kwargs):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target_dir = root / "@chan"
+            target_dir.mkdir()
+            (target_dir / "file.jpg").write_bytes(b"same bytes")
+
+            cfg = replace(
+                make_cfg(legacy_per_target_dedupe=legacy_per_target_dedupe),
+                backlog_root=root,
+                backlog_roots=[root],
+                targets_allowlist=["@chan"],
+                settle_seconds=0,
+            )
+            store = Store()
+
+            await backlogbot.scan_backlog(cfg, store, app=None)
+
+        return store
+
+
 class LeftoverPostedDuplicateHelperTests(unittest.TestCase):
     def test_same_rel_path_is_leftover_not_duplicate(self):
-        existing = {"status": "posted", "rel_path": "chan/file.jpg"}
-        self.assertTrue(backlogbot.is_leftover_of_posted_item(existing, "chan/file.jpg"))
+        existing = {"target_key": "@chan", "status": "posted", "rel_path": "chan/file.jpg"}
+        self.assertTrue(backlogbot.is_leftover_of_posted_item(existing, "@chan", "chan/file.jpg"))
 
     def test_different_rel_path_is_genuine_duplicate(self):
-        existing = {"status": "posted", "rel_path": "chan/original.jpg"}
-        self.assertFalse(backlogbot.is_leftover_of_posted_item(existing, "chan/copy.jpg"))
+        existing = {"target_key": "@chan", "status": "posted", "rel_path": "chan/original.jpg"}
+        self.assertFalse(backlogbot.is_leftover_of_posted_item(existing, "@chan", "chan/copy.jpg"))
+
+    def test_different_target_is_genuine_duplicate(self):
+        existing = {"target_key": "@other", "status": "posted", "rel_path": "chan/file.jpg"}
+        self.assertFalse(backlogbot.is_leftover_of_posted_item(existing, "@chan", "chan/file.jpg"))
 
 
 if __name__ == "__main__":

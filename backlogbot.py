@@ -83,11 +83,13 @@ def _log_env_snapshot() -> None:
 
     logger.info(
         "Env snapshot: BACKLOG_ENABLE=%r BACKLOG_ROOT=%r BACKLOG_ARCHIVE_ROOT=%r BACKLOG_TARGETS=%r "
-        "BACKLOG_STATE_DB=%r MONGO_URL=%s TG_API_ID=%s TG_API_HASH=%s TG_PASSWORD=%s TZ=%r",
+        "BACKLOG_LEGACY_PER_TARGET_DEDUPE=%r BACKLOG_STATE_DB=%r MONGO_URL=%s "
+        "TG_API_ID=%s TG_API_HASH=%s TG_PASSWORD=%s TZ=%r",
         os.getenv("BACKLOG_ENABLE"),
         os.getenv("BACKLOG_ROOT"),
         os.getenv("BACKLOG_ARCHIVE_ROOT"),
         os.getenv("BACKLOG_TARGETS"),
+        os.getenv("BACKLOG_LEGACY_PER_TARGET_DEDUPE"),
         os.getenv("BACKLOG_STATE_DB"),
         "set" if os.getenv("MONGO_URL") else "missing",
         _present("TG_API_ID"),
@@ -155,6 +157,10 @@ class BacklogConfig:
     # If true, do not quarantine files for non-allowlisted targets; just ignore them.
     skip_quarantine_unmapped_targets: bool
 
+    # Legacy mode: if true, duplicate detection only matches within the same target.
+    # The default is global duplicate detection across all targets.
+    legacy_per_target_dedupe: bool
+
     # Direct-post mode convenience: if true, allow posting one item immediately per target
     # when the process starts, even if BACKLOG_INTERVAL_SECONDS hasn't elapsed yet.
     immediate_post_on_start: bool
@@ -219,6 +225,11 @@ def load_config() -> BacklogConfig:
             False,
         ),
 
+        legacy_per_target_dedupe=_env_bool(
+            "BACKLOG_LEGACY_PER_TARGET_DEDUPE",
+            False,
+        ),
+
         immediate_post_on_start=_env_bool(
             "BACKLOG_IMMEDIATE_POST_ON_START",
             False,
@@ -249,7 +260,8 @@ def load_config() -> BacklogConfig:
     logger.info(
         "Config: enabled=%s root=%s roots=%s archive=%s allowlist=%s scan_every=%ss settle=%ss interval=%ss scope=%s overdue=%s "
         "success_action=%s allow_unknown_as_document=%s skip_quarantine_unmapped_targets=%s "
-        "immediate_post_on_start=%s scheduler=%s scheduler_mode=%s schedule_ahead=%ss min_schedule_delay=%ss max_failures=%s state_db=%s tz=%s",
+        "legacy_per_target_dedupe=%s immediate_post_on_start=%s scheduler=%s scheduler_mode=%s "
+        "schedule_ahead=%ss min_schedule_delay=%ss max_failures=%s state_db=%s tz=%s",
         cfg.enabled,
         cfg.backlog_root,
         cfg.backlog_roots,
@@ -263,6 +275,7 @@ def load_config() -> BacklogConfig:
         cfg.success_action,
         cfg.allow_unknown_as_document,
         cfg.skip_quarantine_unmapped_targets,
+        cfg.legacy_per_target_dedupe,
         cfg.immediate_post_on_start,
         cfg.use_telegram_scheduler,
         cfg.scheduler_mode,
@@ -435,25 +448,47 @@ class BacklogStore:
         except Exception:
             pass
 
-    async def find_existing_content_item(self, *, target_key: str, sha256: str) -> Optional[Dict[str, Any]]:
-        """Return an existing item with the same content hash for this target.
+    async def find_existing_content_item(
+        self,
+        *,
+        target_key: Optional[str],
+        sha256: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return an existing item with the same content hash.
 
-        Used for de-duplication decisions. Note that callers may choose to quarantine
-        only when the existing item is already posted.
+        If target_key is None, match across all targets. Otherwise, preserve the
+        legacy behavior and only match within that target. Posted items are checked
+        first so a pending duplicate cannot hide already-posted content.
         """
+        base_query: Dict[str, Any] = {"sha256": sha256}
+        if target_key is not None:
+            base_query["target_key"] = target_key
+
+        projection = {
+            "_id": 1,
+            "target_key": 1,
+            "rel_path": 1,
+            "status": 1,
+            "posted_message_id": 1,
+            "scheduled_message_id": 1,
+        }
+
+        posted = await self.items.find_one(
+            {
+                **base_query,
+                "status": "posted",
+            },
+            projection=projection,
+        )
+        if posted:
+            return posted
+
         return await self.items.find_one(
             {
-                "target_key": target_key,
-                "sha256": sha256,
-                "status": {"$in": ["pending", "scheduled", "posted"]},
+                **base_query,
+                "status": {"$in": ["pending", "scheduled"]},
             },
-            projection={
-                "_id": 1,
-                "rel_path": 1,
-                "status": 1,
-                "posted_message_id": 1,
-                "scheduled_message_id": 1,
-            },
+            projection=projection,
         )
 
     async def get_or_create_target(self, target_key: str) -> Dict[str, Any]:
@@ -915,10 +950,17 @@ async def cleanup_scheduled_local_files(
             )
 
 
-def is_leftover_of_posted_item(existing: Dict[str, Any], current_rel_path: str) -> bool:
+def is_leftover_of_posted_item(
+    existing: Dict[str, Any],
+    current_target_key: str,
+    current_rel_path: str,
+) -> bool:
     """True if a rediscovered file is the same already-posted item (cleanup failed
     earlier), as opposed to a genuinely separate file with identical content."""
-    return existing.get("rel_path") == current_rel_path
+    return (
+        existing.get("target_key") == current_target_key
+        and existing.get("rel_path") == current_rel_path
+    )
 
 
 def rel_path_from_any_root(cfg: BacklogConfig, path: Path) -> str:
@@ -1103,13 +1145,18 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore, app: Optional[Cl
                     logger.debug("scan_backlog: file not settled yet: %s", p)
                     continue
 
-                # De-dup by content hash per target.
+                # De-dup by content hash. By default this matches already-posted
+                # content across all targets; the legacy flag scopes it per target.
                 # IMPORTANT: only quarantine when we know the content was already POSTED.
                 # If the existing item is merely pending/scheduled, it's not a true duplicate
                 # yet (it might never get posted), so we leave this file alone.
                 try:
                     sha_for_dedup = compute_sha256(p)
-                    existing = await store.find_existing_content_item(target_key=target_key, sha256=sha_for_dedup)
+                    dedupe_target_key = target_key if cfg.legacy_per_target_dedupe else None
+                    existing = await store.find_existing_content_item(
+                        target_key=dedupe_target_key,
+                        sha256=sha_for_dedup,
+                    )
                 except Exception as e:
                     logger.warning("scan_backlog: failed duplicate check for %s: %s", p, e)
                     existing = None
@@ -1117,7 +1164,7 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore, app: Optional[Cl
 
                 if existing and existing.get("status") == "posted":
                     current_rel = rel_path_from_any_root(cfg, p)
-                    if is_leftover_of_posted_item(existing, current_rel):
+                    if is_leftover_of_posted_item(existing, target_key, current_rel):
                         # Same file, same path, already marked posted: this is a
                         # leftover from a post-success cleanup failure, not a true
                         # duplicate. Retry cleanup instead of quarantining it.
@@ -1140,10 +1187,11 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore, app: Optional[Cl
                         continue
 
                     logger.info(
-                        "scan_backlog: duplicate content; quarantining target=%s rel=%s sha=%s existing_status=%s existing_rel=%s",
+                        "scan_backlog: duplicate content; quarantining target=%s rel=%s sha=%s existing_target=%s existing_status=%s existing_rel=%s",
                         target_key,
                         current_rel,
                         (sha_for_dedup or "")[:12],
+                        existing.get("target_key"),
                         existing.get("status"),
                         existing.get("rel_path"),
                     )
@@ -1158,11 +1206,12 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore, app: Optional[Cl
                     continue
                 elif existing:
                     logger.debug(
-                        "scan_backlog: duplicate content but existing_status=%s (not quarantining) target=%s rel=%s sha=%s existing_rel=%s",
+                        "scan_backlog: duplicate content but existing_status=%s (not quarantining) target=%s rel=%s sha=%s existing_target=%s existing_rel=%s",
                         existing.get("status"),
                         target_key,
                         rel_path_from_any_root(cfg, p),
                         (sha_for_dedup or "")[:12],
+                        existing.get("target_key"),
                         existing.get("rel_path"),
                     )
 

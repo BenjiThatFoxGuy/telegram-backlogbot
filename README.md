@@ -53,6 +53,9 @@ docker run --rm \
 - `BACKLOG_SUCCESS_ACTION` (default: `delete`, allowed: `delete|archive`)
 - `BACKLOG_ALLOW_UNKNOWN_AS_DOCUMENT` (default: `false`)
 - `BACKLOG_SKIP_QUARANTINE_UNMAPPED_TARGETS` (default: `false`)
+- `BACKLOG_LEGACY_PER_TARGET_DEDUPE` (default: `false`): when `false`,
+  already-posted duplicate content is detected across all targets; when `true`,
+  duplicate detection is limited to the same target as in earlier versions.
 - `BACKLOG_IMMEDIATE_POST_ON_START` (default: `false`)
 
 ### Telegram scheduler mode (optional)
