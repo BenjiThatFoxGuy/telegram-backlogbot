@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -91,6 +92,108 @@ class MarkPostSuccessOrderingTests(unittest.IsolatedAsyncioTestCase):
             "failure can never cause the item to be reposted.",
         )
         mock_log.assert_called_once()
+
+
+class MarkScheduleSuccessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_scheduled_status_persists_before_cleanup_and_marker(self):
+        cfg = make_cfg(success_action="archive")
+        item = {"_id": "item1", "target_key": "@chan", "rel_path": "chan/file.jpg"}
+        scheduled_at = datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc)
+
+        call_order = []
+        store = AsyncMock()
+
+        async def fake_set_item_status(item_id, status, **fields):
+            call_order.append("set_item_status")
+
+        async def fake_update_one(*args, **kwargs):
+            call_order.append("targets.update_one")
+
+        async def fake_marker(item_id):
+            call_order.append("mark_local_success_action_applied")
+
+        async def fake_handle_success(*args, **kwargs):
+            call_order.append("handle_success")
+
+        store.set_item_status = AsyncMock(side_effect=fake_set_item_status)
+        store.targets.update_one = AsyncMock(side_effect=fake_update_one)
+        store.mark_local_success_action_applied = AsyncMock(side_effect=fake_marker)
+
+        with patch.object(backlogbot, "handle_success", side_effect=fake_handle_success), \
+             patch.object(backlogbot, "resolve_media_path", return_value=Path("/backlog/chan/file.jpg")), \
+             patch.object(Path, "exists", return_value=False):
+            await backlogbot.mark_schedule_success(
+                cfg,
+                store,
+                item,
+                message_id=99,
+                scheduled_at=scheduled_at,
+            )
+
+        store.set_item_status.assert_called_once()
+        args, kwargs = store.set_item_status.call_args
+        self.assertEqual(args[1], "scheduled")
+        self.assertEqual(kwargs["scheduled_message_id"], 99)
+        self.assertEqual(kwargs["scheduled_at"], scheduled_at)
+        self.assertIsNone(kwargs["local_success_action_at"])
+
+        self.assertEqual(
+            call_order,
+            [
+                "set_item_status",
+                "targets.update_one",
+                "handle_success",
+                "mark_local_success_action_applied",
+            ],
+        )
+
+
+class CleanupScheduledLocalFilesTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cleans_scheduled_items_without_success_marker(self):
+        cfg = make_cfg(success_action="archive")
+        item = {"_id": "item1", "target_key": "@chan", "rel_path": "chan/file.jpg"}
+
+        class AsyncList:
+            def __init__(self, values):
+                self.values = list(values)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if not self.values:
+                    raise StopAsyncIteration
+                return self.values.pop(0)
+
+        class Items:
+            def __init__(self, values):
+                self.values = values
+                self.query = None
+
+            def find(self, query):
+                self.query = query
+                return AsyncList(self.values)
+
+        class Store:
+            def __init__(self):
+                self.items = Items([item])
+                self.marked = []
+
+            async def mark_local_success_action_applied(self, item_id):
+                self.marked.append(item_id)
+
+        store = Store()
+
+        with patch.object(backlogbot, "handle_success", new_callable=AsyncMock) as mock_handle_success, \
+             patch.object(backlogbot, "resolve_media_path", return_value=Path("/backlog/chan/file.jpg")), \
+             patch.object(Path, "exists", return_value=False):
+            await backlogbot.cleanup_scheduled_local_files(cfg, store, target_key="@chan")
+
+        self.assertEqual(store.items.query["status"], "scheduled")
+        self.assertEqual(store.items.query["target_key"], "@chan")
+        self.assertIn({"local_success_action_at": {"$exists": False}}, store.items.query["$or"])
+        mock_handle_success.assert_called_once()
+        self.assertEqual(store.marked, ["item1"])
 
 
 class LeftoverPostedDuplicateHelperTests(unittest.TestCase):

@@ -62,6 +62,10 @@ docker run --rm \
 - `BACKLOG_SCHEDULE_AHEAD` (default: `7d`) — only used when scheduler is enabled.
 - `BACKLOG_MIN_SCHEDULE_DELAY_SECONDS` (default: `120`)
 
+When Telegram accepts a scheduled message, the local file is immediately handled
+according to `BACKLOG_SUCCESS_ACTION` (`delete` or `archive`). Existing scheduled
+items without that cleanup marker are caught up on later scheduler ticks.
+
 ### Reliability
 
 - `BACKLOG_MAX_FAILURES` (default: `5`)

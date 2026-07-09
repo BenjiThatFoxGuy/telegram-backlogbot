@@ -545,6 +545,12 @@ class BacklogStore:
         fields["updated_at"] = now_utc()
         await self.items.update_one({"_id": item_id}, {"$set": fields})
 
+    async def mark_local_success_action_applied(self, item_id: Any) -> None:
+        await self.items.update_one(
+            {"_id": item_id},
+            {"$set": {"local_success_action_at": now_utc(), "updated_at": now_utc()}},
+        )
+
     async def bump_failure(self, item_id: Any, error: str, retry_after_seconds: int) -> Dict[str, Any]:
         await self.items.update_one(
             {"_id": item_id},
@@ -797,6 +803,116 @@ async def handle_success(cfg: BacklogConfig, *, target_key: str, media: Path, si
     if cfg.success_action == "archive":
         await archive_paths(cfg, bucket="_posted", target_key=target_key, paths=[media] + sidecars)
         return
+
+
+async def cleanup_success_item_files(cfg: BacklogConfig, item: Dict[str, Any], *, context: str) -> bool:
+    """Best-effort local success action after Telegram accepted an item."""
+    target_key = item["target_key"]
+    media = resolve_media_path(cfg, item["rel_path"])
+    sidecar = caption_sidecar_for(media)
+    sidecars = [sidecar] if sidecar.exists() else []
+    original_paths = [media] + sidecars
+    try:
+        await handle_success(cfg, target_key=target_key, media=media, sidecars=sidecars)
+    except Exception:
+        logger.exception(
+            "%s: success-action cleanup failed (item state already persisted; "
+            "file may be left in place) item_id=%s target=%s rel_path=%s action=%s",
+            context,
+            item.get("_id"),
+            target_key,
+            item["rel_path"],
+            cfg.success_action,
+        )
+        return False
+
+    remaining = [p for p in original_paths if p.exists()]
+    if remaining:
+        logger.warning(
+            "%s: success-action cleanup left local files in place; will retry "
+            "item_id=%s target=%s rel_path=%s action=%s remaining=%s",
+            context,
+            item.get("_id"),
+            target_key,
+            item["rel_path"],
+            cfg.success_action,
+            ", ".join(str(p) for p in remaining),
+        )
+        return False
+
+    return True
+
+
+async def mark_schedule_success(
+    cfg: BacklogConfig,
+    store: BacklogStore,
+    item: Dict[str, Any],
+    *,
+    message_id: Optional[int],
+    scheduled_at: datetime,
+) -> None:
+    target_key = item["target_key"]
+
+    # Persist the Telegram-scheduled state before touching local files. The file
+    # can be safely deleted/archived after Telegram has accepted the upload.
+    await store.set_item_status(
+        item["_id"],
+        "scheduled",
+        scheduled_message_id=message_id,
+        scheduled_at=scheduled_at,
+        local_success_action_at=None,
+    )
+    await store.targets.update_one(
+        {"_id": target_key},
+        {
+            "$set": {
+                "last_scheduled_at": scheduled_at,
+                **(
+                    {"cadence_next_at": scheduled_at + timedelta(seconds=cfg.interval_seconds)}
+                    if cfg.scheduler_mode == "fixed_cadence"
+                    else {}
+                ),
+                "updated_at": now_utc(),
+            }
+        },
+    )
+
+    if await cleanup_success_item_files(cfg, item, context="mark_schedule_success"):
+        await store.mark_local_success_action_applied(item["_id"])
+
+
+async def cleanup_scheduled_local_files(
+    cfg: BacklogConfig,
+    store: BacklogStore,
+    *,
+    target_key: Optional[str] = None,
+) -> None:
+    query: Dict[str, Any] = {
+        "status": "scheduled",
+        "$or": [
+            {"local_success_action_at": {"$exists": False}},
+            {"local_success_action_at": None},
+        ],
+    }
+    if target_key is not None:
+        query["target_key"] = target_key
+
+    async for item in store.items.find(query):
+        try:
+            if await cleanup_success_item_files(cfg, item, context="cleanup_scheduled_local_files"):
+                await store.mark_local_success_action_applied(item["_id"])
+                logger.info(
+                    "cleanup_scheduled_local_files: applied success action target=%s rel=%s",
+                    item.get("target_key"),
+                    item.get("rel_path"),
+                )
+        except Exception:
+            logger.exception(
+                "cleanup_scheduled_local_files: unhandled cleanup error target=%s rel=%s item_id=%s",
+                item.get("target_key"),
+                item.get("rel_path"),
+                item.get("_id"),
+            )
 
 
 def is_leftover_of_posted_item(existing: Dict[str, Any], current_rel_path: str) -> bool:
@@ -1223,20 +1339,7 @@ async def mark_post_success(
 
     # Best-effort local cleanup. Must never undo the guarantee above or crash the
     # caller: log loudly on failure and move on.
-    media = resolve_media_path(cfg, item["rel_path"])
-    sidecar = caption_sidecar_for(media)
-    sidecars = [sidecar] if sidecar.exists() else []
-    try:
-        await handle_success(cfg, target_key=target_key, media=media, sidecars=sidecars)
-    except Exception:
-        logger.exception(
-            "mark_post_success: post-success cleanup failed (item already marked "
-            "posted; file may be left in place) item_id=%s target=%s rel_path=%s action=%s",
-            item["_id"],
-            target_key,
-            item["rel_path"],
-            cfg.success_action,
-        )
+    await cleanup_success_item_files(cfg, item, context="mark_post_success")
 
 
 async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client) -> None:
@@ -1637,25 +1740,12 @@ async def telegram_scheduler_loop(cfg: BacklogConfig, store: BacklogStore, app: 
                         next_time,
                         msg_id,
                     )
-                    await store.set_item_status(
-                        item["_id"],
-                        "scheduled",
-                        scheduled_message_id=msg_id,
+                    await mark_schedule_success(
+                        cfg,
+                        store,
+                        item,
+                        message_id=msg_id,
                         scheduled_at=next_time,
-                    )
-                    await store.targets.update_one(
-                        {"_id": target_key},
-                        {
-                            "$set": {
-                                "last_scheduled_at": next_time,
-                                **(
-                                    {"cadence_next_at": next_time + timedelta(seconds=cfg.interval_seconds)}
-                                    if cfg.scheduler_mode == "fixed_cadence"
-                                    else {}
-                                ),
-                                "updated_at": now_utc(),
-                            }
-                        },
                     )
                     # increment next schedule slot
                     next_time = _ceil_to_minute(next_time + timedelta(seconds=cfg.interval_seconds))
@@ -1677,6 +1767,7 @@ async def telegram_scheduler_loop(cfg: BacklogConfig, store: BacklogStore, app: 
                         await store.set_item_status(item["_id"], "failed")
                     break
 
+        await cleanup_scheduled_local_files(cfg, store)
         await asyncio.sleep(cfg.scan_every_seconds)
 
 
