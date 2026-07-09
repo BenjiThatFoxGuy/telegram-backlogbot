@@ -200,6 +200,121 @@ class CleanupScheduledLocalFilesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.marked, ["item1"])
 
 
+class SchedulerReconcileTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fetches_pyrofork_scheduled_messages_by_tracked_ids(self):
+        cfg = make_cfg()
+        item = {
+            "_id": "item1",
+            "target_key": "-1004448064069",
+            "rel_path": "chan/file.jpg",
+            "status": "scheduled",
+            "scheduled_message_id": 99,
+            "scheduled_at": datetime(2099, 1, 1, tzinfo=timezone.utc),
+        }
+
+        class Message:
+            id = 99
+
+        class AsyncList:
+            def __init__(self, values):
+                self.values = list(values)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if not self.values:
+                    raise StopAsyncIteration
+                return self.values.pop(0)
+
+        class Items:
+            def __init__(self):
+                self.queries = []
+
+            def find(self, query):
+                self.queries.append(query)
+                return AsyncList([item])
+
+        class Store:
+            def __init__(self):
+                self.items = Items()
+                self.status_updates = []
+
+            async def set_item_status(self, *args, **kwargs):
+                self.status_updates.append((args, kwargs))
+
+        class App:
+            def __init__(self):
+                self.calls = []
+
+            async def get_scheduled_messages(self, chat_id, message_ids):
+                self.calls.append((chat_id, list(message_ids)))
+                return [Message()]
+
+        store = Store()
+        app = App()
+
+        await backlogbot.scheduler_reconcile(cfg, app, store, target_key="-1004448064069")
+
+        self.assertEqual(app.calls, [(-1004448064069, [99])])
+        self.assertEqual(store.status_updates, [])
+        self.assertEqual(len(store.items.queries), 2)
+
+    async def test_reconcile_supports_older_one_argument_scheduled_getter(self):
+        cfg = make_cfg()
+        item = {
+            "_id": "item1",
+            "target_key": "@chan",
+            "rel_path": "chan/file.jpg",
+            "status": "scheduled",
+            "scheduled_message_id": 99,
+            "scheduled_at": datetime(2099, 1, 1, tzinfo=timezone.utc),
+        }
+
+        class Message:
+            id = 99
+
+        class AsyncList:
+            def __init__(self, values):
+                self.values = list(values)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if not self.values:
+                    raise StopAsyncIteration
+                return self.values.pop(0)
+
+        class Items:
+            def find(self, query):
+                return AsyncList([item])
+
+        class Store:
+            def __init__(self):
+                self.items = Items()
+                self.status_updates = []
+
+            async def set_item_status(self, *args, **kwargs):
+                self.status_updates.append((args, kwargs))
+
+        class App:
+            def __init__(self):
+                self.calls = []
+
+            async def get_scheduled_messages(self, chat_id):
+                self.calls.append(chat_id)
+                return [Message()]
+
+        store = Store()
+        app = App()
+
+        await backlogbot.scheduler_reconcile(cfg, app, store, target_key="@chan")
+
+        self.assertEqual(app.calls, ["@chan"])
+        self.assertEqual(store.status_updates, [])
+
+
 class ConfigTests(unittest.TestCase):
     def test_legacy_per_target_dedupe_defaults_off(self):
         with patch.dict(os.environ, {}, clear=True):

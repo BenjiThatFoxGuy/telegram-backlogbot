@@ -1627,6 +1627,14 @@ async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client)
 
 async def scheduler_reconcile(cfg: BacklogConfig, app: Client, store: BacklogStore, target_key: str) -> None:
     """Fetch scheduled messages and reconcile DB. Best-effort."""
+    tracked_ids: List[int] = []
+    seen_ids = set()
+    async for item in store.items.find({"target_key": target_key, "status": "scheduled"}):
+        mid = item.get("scheduled_message_id")
+        if isinstance(mid, int) and mid not in seen_ids:
+            tracked_ids.append(mid)
+            seen_ids.add(mid)
+
     # Pyrogram API varies; guard to avoid crashes.
     getter = getattr(app, "get_scheduled_messages", None)
     if getter is None:
@@ -1652,7 +1660,23 @@ async def scheduler_reconcile(cfg: BacklogConfig, app: Client, store: BacklogSto
         return
 
     try:
-        scheduled = await getter(_target_token_for_pyrogram(target_key))
+        scheduled = []
+        if tracked_ids:
+            target_token = _target_token_for_pyrogram(target_key)
+            try:
+                for i in range(0, len(tracked_ids), 200):
+                    chunk = await getter(target_token, tracked_ids[i:i + 200])
+                    if chunk is None:
+                        continue
+                    if isinstance(chunk, (list, tuple)):
+                        scheduled.extend(chunk)
+                    else:
+                        scheduled.append(chunk)
+            except TypeError as e:
+                msg = str(e)
+                if "positional argument" not in msg and "positional arguments" not in msg:
+                    raise
+                scheduled = await getter(target_token)
     except Exception as e:
         logger.warning("Failed to fetch scheduled messages for %s: %s", target_key, e)
         return
