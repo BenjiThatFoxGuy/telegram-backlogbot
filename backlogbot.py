@@ -142,6 +142,7 @@ class BacklogConfig:
     archive_root: Path
 
     targets_allowlist: List[str]
+    target_aliases: Dict[str, int]
 
     scan_every_seconds: int
     settle_seconds: int
@@ -217,6 +218,8 @@ def load_config() -> BacklogConfig:
     allowlist_raw = _env_str("BACKLOG_TARGETS", "").strip()
     targets_allowlist = [t.strip() for t in allowlist_raw.split(",") if t.strip()]
 
+    target_aliases = parse_target_aliases(_env_str("BACKLOG_TARGET_ALIASES", ""))
+
     use_scheduler = _env_bool("BACKLOG_USE_TELEGRAM_SCHEDULER", False)
     schedule_ahead_raw = _env_str("BACKLOG_SCHEDULE_AHEAD", "7d")
     scheduler_mode = _env_str("BACKLOG_SCHEDULER_MODE", "fixed_cadence").strip()
@@ -227,6 +230,7 @@ def load_config() -> BacklogConfig:
         backlog_roots=backlog_roots,
         archive_root=archive_root,
         targets_allowlist=targets_allowlist,
+        target_aliases=target_aliases,
         scan_every_seconds=_env_int("BACKLOG_SCAN_EVERY_SECONDS", 30),
         settle_seconds=_env_int("BACKLOG_SETTLE_SECONDS", 30),
         interval_seconds=_env_int("BACKLOG_INTERVAL_SECONDS", 21600),
@@ -273,7 +277,7 @@ def load_config() -> BacklogConfig:
         raise ValueError("BACKLOG_SCHEDULER_MODE must be 'fixed_cadence' or 'legacy'")
 
     logger.info(
-        "Config: enabled=%s root=%s roots=%s archive=%s allowlist=%s scan_every=%ss settle=%ss interval=%ss scope=%s overdue=%s "
+        "Config: enabled=%s root=%s roots=%s archive=%s allowlist=%s target_aliases=%s scan_every=%ss settle=%ss interval=%ss scope=%s overdue=%s "
         "success_action=%s allow_unknown_as_document=%s skip_quarantine_unmapped_targets=%s "
         "legacy_per_target_dedupe=%s immediate_post_on_start=%s scheduler=%s scheduler_mode=%s "
         "schedule_ahead=%ss min_schedule_delay=%ss max_failures=%s state_db=%s tz=%s",
@@ -282,6 +286,7 @@ def load_config() -> BacklogConfig:
         cfg.backlog_roots,
         cfg.archive_root,
         cfg.targets_allowlist,
+        cfg.target_aliases,
         cfg.scan_every_seconds,
         cfg.settle_seconds,
         cfg.interval_seconds,
@@ -417,6 +422,54 @@ def parse_allowlist(tokens: Iterable[str]) -> List[str]:
         if t:
             out.append(t)
     return out
+
+
+def parse_target_aliases(raw: str) -> Dict[str, int]:
+    """Parse 'oldname=-100123,other=-100456' into a token->peer_id map.
+
+    Lets a target token (as used in BACKLOG_TARGETS or a backlog folder name) be
+    aliased directly to a numeric Telegram peer_id, bypassing live resolution. This
+    is meant for channels that went private after previously being resolvable by
+    username: the mapping is trusted as-is, with no verification against Telegram
+    or any cached peer store. Both '@name' and 'name' variants are registered for
+    username-ish keys so the alias matches regardless of how the token is written
+    elsewhere. First occurrence wins on duplicate keys.
+    """
+    aliases: Dict[str, int] = {}
+
+    def _add(alias: str, peer_id: int) -> None:
+        alias = alias.strip()
+        if not alias:
+            return
+        aliases.setdefault(alias, peer_id)
+
+    raw = raw.strip()
+    if not raw:
+        return aliases
+
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if "=" not in pair:
+            raise ValueError(f"BACKLOG_TARGET_ALIASES entry {pair!r} must be 'name=peer_id'")
+        key, _, value = pair.partition("=")
+        key = normalize_target_token(key)
+        value = value.strip()
+        if not key or not value:
+            raise ValueError(f"BACKLOG_TARGET_ALIASES entry {pair!r} must be 'name=peer_id'")
+        try:
+            peer_id = int(value)
+        except ValueError:
+            raise ValueError(f"BACKLOG_TARGET_ALIASES entry {pair!r} has a non-integer peer_id")
+
+        _add(key, peer_id)
+        if key.startswith("@"):
+            _add(key[1:], peer_id)
+        elif re.fullmatch(r"[A-Za-z0-9_]{4,}", key):
+            _add(f"@{key}", peer_id)
+
+    return aliases
 
 
 def sha_marker(sha256: str) -> str:
@@ -752,7 +805,11 @@ def _target_token_for_pyrogram(token: str) -> Any:
     return token
 
 
-async def scheduled_messages_target_token(store: Any, target_key: str) -> Any:
+async def scheduled_messages_target_token(
+    store: Any,
+    target_key: str,
+    target_aliases: Optional[Dict[str, int]] = None,
+) -> Any:
     get_target = getattr(store, "get_or_create_target", None)
     if get_target is not None:
         try:
@@ -763,10 +820,21 @@ async def scheduled_messages_target_token(store: Any, target_key: str) -> Any:
         except Exception:
             logger.debug("scheduler_reconcile: failed to read cached peer_id for %s", target_key)
 
+    if target_aliases:
+        for tok in (target_key, normalize_target_token(target_key)):
+            if tok in target_aliases:
+                return target_aliases[tok]
+
     return _target_token_for_pyrogram(target_key)
 
 
-async def resolve_peer_id(app: Client, store: BacklogStore, target_key: str, allowlist_token: str) -> int:
+async def resolve_peer_id(
+    app: Client,
+    store: BacklogStore,
+    target_key: str,
+    allowlist_token: str,
+    target_aliases: Dict[str, int],
+) -> int:
     """Resolve and cache peer_id. allowlist_token is the configured allowlist entry."""
     target = await store.get_or_create_target(target_key)
     cached = target.get("peer_id")
@@ -796,6 +864,14 @@ async def resolve_peer_id(app: Client, store: BacklogStore, target_key: str, all
     # De-dup while preserving order
     seen: set[str] = set()
     try_tokens = [t for t in try_tokens if not (t in seen or seen.add(t))]
+
+    # Config-provided aliases (old username -> numeric id, e.g. a channel that went
+    # private) are trusted as-is: no Telegram lookup or peer-cache verification.
+    for tok in try_tokens:
+        if tok in target_aliases:
+            peer_id = target_aliases[tok]
+            await store.set_target_peer_id(target_key, peer_id)
+            return peer_id
 
     for tok in try_tokens:
         try:
@@ -1178,6 +1254,7 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore, app: Optional[Cl
                         store,
                         target_key=folder_name,
                         allowlist_token=folder_name,
+                        target_aliases=cfg.target_aliases,
                     )
                 except Exception:
                     folder_peer_id = None
@@ -1190,6 +1267,7 @@ async def scan_backlog(cfg: BacklogConfig, store: BacklogStore, app: Optional[Cl
                                 store,
                                 target_key=allow_tok,
                                 allowlist_token=allow_tok,
+                                target_aliases=cfg.target_aliases,
                             )
                         except Exception:
                             continue
@@ -1558,7 +1636,7 @@ async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client)
                     continue
 
             try:
-                peer_id = await resolve_peer_id(app, store, target_key, target_key)
+                peer_id = await resolve_peer_id(app, store, target_key, target_key, cfg.target_aliases)
                 ok, msg_id, err = await send_one_item(
                     cfg,
                     store,
@@ -1619,7 +1697,7 @@ async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client)
                             item.get("rel_path"),
                         )
                         try:
-                            peer_id = await resolve_peer_id(app, store, target_key, target_key)
+                            peer_id = await resolve_peer_id(app, store, target_key, target_key, cfg.target_aliases)
                             ok, msg_id, err = await send_one_item(
                                 cfg,
                                 store,
@@ -1683,7 +1761,7 @@ async def direct_post_loop(cfg: BacklogConfig, store: BacklogStore, app: Client)
                 continue
 
             try:
-                peer_id = await resolve_peer_id(app, store, target_key, target_key)
+                peer_id = await resolve_peer_id(app, store, target_key, target_key, cfg.target_aliases)
                 ok, msg_id, err = await send_one_item(
                     cfg,
                     store,
@@ -1762,7 +1840,7 @@ async def scheduler_reconcile(cfg: BacklogConfig, app: Client, store: BacklogSto
     try:
         scheduled = []
         if tracked_ids:
-            target_token = await scheduled_messages_target_token(store, target_key)
+            target_token = await scheduled_messages_target_token(store, target_key, cfg.target_aliases)
             try:
                 for i in range(0, len(tracked_ids), 200):
                     chunk = await getter(target_token, tracked_ids[i:i + 200])
@@ -1840,7 +1918,7 @@ async def telegram_scheduler_loop(cfg: BacklogConfig, store: BacklogStore, app: 
             await scheduler_reconcile(cfg, app, store, target_key)
 
             target_doc = await store.get_or_create_target(target_key)
-            peer_id = await resolve_peer_id(app, store, target_key, target_key)
+            peer_id = await resolve_peer_id(app, store, target_key, target_key, cfg.target_aliases)
 
             # Telegram scheduling is effectively minute-granular; avoid scheduling within the
             # current minute on startup by rounding up to the next minute boundary.

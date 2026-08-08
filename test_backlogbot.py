@@ -16,6 +16,7 @@ def make_cfg(success_action="delete", legacy_per_target_dedupe=False):
         backlog_roots=[Path("/backlog")],
         archive_root=Path("/backlog_archive"),
         targets_allowlist=[],
+        target_aliases={},
         scan_every_seconds=30,
         settle_seconds=30,
         interval_seconds=21600,
@@ -441,6 +442,84 @@ class SchedulerReconcileTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.status_updates, [])
 
 
+class ParseTargetAliasesTests(unittest.TestCase):
+    def test_parses_multiple_pairs_with_username_variants(self):
+        aliases = backlogbot.parse_target_aliases("oldname=-1001234567890, @otherold = -1009876543210")
+
+        self.assertEqual(aliases["oldname"], -1001234567890)
+        self.assertEqual(aliases["@oldname"], -1001234567890)
+        self.assertEqual(aliases["@otherold"], -1009876543210)
+        self.assertEqual(aliases["otherold"], -1009876543210)
+
+    def test_empty_raw_returns_empty_map(self):
+        self.assertEqual(backlogbot.parse_target_aliases(""), {})
+
+    def test_missing_equals_sign_raises(self):
+        with self.assertRaises(ValueError):
+            backlogbot.parse_target_aliases("oldname-1001234567890")
+
+    def test_non_integer_peer_id_raises(self):
+        with self.assertRaises(ValueError):
+            backlogbot.parse_target_aliases("oldname=notanumber")
+
+
+class ResolvePeerIdAliasTests(unittest.IsolatedAsyncioTestCase):
+    class Store:
+        def __init__(self, cached_peer_id=None):
+            self.cached_peer_id = cached_peer_id
+            self.set_calls = []
+
+        async def get_or_create_target(self, target_key):
+            return {"_id": target_key, "peer_id": self.cached_peer_id}
+
+        async def set_target_peer_id(self, target_key, peer_id):
+            self.set_calls.append((target_key, peer_id))
+            self.cached_peer_id = peer_id
+
+    class App:
+        def __init__(self):
+            self.get_chat_calls = []
+
+        async def get_chat(self, chat_id):
+            self.get_chat_calls.append(chat_id)
+            raise AssertionError("get_chat should not be called for an aliased target")
+
+    async def test_aliased_target_resolves_without_calling_telegram(self):
+        store = self.Store()
+        app = self.App()
+        aliases = {"@oldname": -1001234567890}
+
+        peer_id = await backlogbot.resolve_peer_id(app, store, "@oldname", "@oldname", aliases)
+
+        self.assertEqual(peer_id, -1001234567890)
+        self.assertEqual(app.get_chat_calls, [])
+        self.assertEqual(store.set_calls, [("@oldname", -1001234567890)])
+
+    async def test_cached_peer_id_still_wins_over_alias(self):
+        store = self.Store(cached_peer_id=-1005555555555)
+        app = self.App()
+        aliases = {"@oldname": -1001234567890}
+
+        peer_id = await backlogbot.resolve_peer_id(app, store, "@oldname", "@oldname", aliases)
+
+        self.assertEqual(peer_id, -1005555555555)
+        self.assertEqual(app.get_chat_calls, [])
+        self.assertEqual(store.set_calls, [])
+
+
+class ScheduledMessagesTargetTokenAliasTests(unittest.IsolatedAsyncioTestCase):
+    async def test_returns_aliased_peer_id_when_nothing_cached(self):
+        class Store:
+            async def get_or_create_target(self, target_key):
+                return {"_id": target_key, "peer_id": None}
+
+        token = await backlogbot.scheduled_messages_target_token(
+            Store(), "@oldname", {"@oldname": -1001234567890}
+        )
+
+        self.assertEqual(token, -1001234567890)
+
+
 class ConfigTests(unittest.TestCase):
     def test_legacy_per_target_dedupe_defaults_off(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -453,6 +532,22 @@ class ConfigTests(unittest.TestCase):
             cfg = backlogbot.load_config()
 
         self.assertTrue(cfg.legacy_per_target_dedupe)
+
+    def test_target_aliases_default_to_empty(self):
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = backlogbot.load_config()
+
+        self.assertEqual(cfg.target_aliases, {})
+
+    def test_target_aliases_parsed_from_env(self):
+        with patch.dict(
+            os.environ,
+            {"BACKLOG_TARGET_ALIASES": "oldname=-1001234567890"},
+            clear=True,
+        ):
+            cfg = backlogbot.load_config()
+
+        self.assertEqual(cfg.target_aliases["@oldname"], -1001234567890)
 
 
 class FindExistingContentItemTests(unittest.IsolatedAsyncioTestCase):
