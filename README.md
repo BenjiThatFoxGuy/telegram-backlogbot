@@ -39,6 +39,16 @@ docker run --rm \
 - `BACKLOG_ROOT_1..BACKLOG_ROOT_50` (optional): if set, these override `BACKLOG_ROOT` and allow multiple input roots.
 - `BACKLOG_ARCHIVE_ROOT` (default: `/backlog_archive`)
 - `BACKLOG_TARGETS` (default: empty): comma-separated allowlist of targets.
+- `BACKLOG_TARGET_ALIASES` (default: empty): comma-separated `name=peer_id` pairs
+  aliasing a target token to a numeric Telegram peer id, e.g.
+  `BACKLOG_TARGET_ALIASES=oldpublicname=-1001234567890`. This is meant for channels
+  that were public (resolvable by `@username`) and have since gone private, so
+  Telegram can no longer resolve them by that old username. When a target token
+  (from `BACKLOG_TARGETS` or a matching backlog folder name) matches an alias, its
+  peer id is used directly — no Telegram lookup or cache verification is performed,
+  the mapping is trusted as-is. This only works if the bot has previously
+  interacted with that channel (e.g. while it was still public), since Telegram
+  still requires a cached access hash to use a bare numeric channel id.
 
 ### Timing / cadence
 
